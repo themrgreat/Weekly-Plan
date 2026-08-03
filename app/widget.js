@@ -46,7 +46,7 @@ console.clear();
 
    Save creates two things (see App.buildPlannerRecord / buildMeetingRecords):
 
-     Weekly_Planner    1 record. Planner_Name is derived ("03 Aug 2026 – 08 Aug
+     Weekly_Planner    1 record. Name is derived ("03 Aug 2026 – 08 Aug
                        2026"). Subform Plan_Details holds one row per visit;
                        a row is single-sided — School_Name OR Dealer_Name, never
                        both — with Purpose, Transport_Medium and Schedule_Status.
