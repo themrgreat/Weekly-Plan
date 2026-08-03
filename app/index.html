@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<!--
+  ==========================================================================
+  Zoho CRM Widget : Weekly Plan
+  --------------------------------------------------------------------------
+  Purpose : Lets a user build a weekly visit plan (Schools / Dealers) for one
+            of the next three upcoming Mondays.
+
+  Files   : index.html  -> markup, templates, SDK bootstrap
+            widget.css  -> presentation layer
+            widget.js   -> state, services, rendering, validation
+
+  Deploy  : Zoho CRM > Setup > Developer Space > Widgets > New Widget
+            Hosting  : Zoho / External
+            Base URL : /index.html   (index.html must sit at the ZIP root)
+
+  plugin-manifest.json (kept outside this deliverable, required by ZET CLI):
+      {
+        "locale": ["en"],
+        "csp": { "connect-src": [], "img-src": [], "style-src": [] },
+        "storage": "local",
+        "modules": {
+          "widgets": [{
+            "url": "/index.html",
+            "name": "Weekly Plan",
+            "description": "Create your weekly visit plan",
+            "widget_type": "MODULE_HOMEPAGE"
+          }]
+        },
+        "cspDomains": { "connect-src": [] }
+      }
+
+  SDK     : https://live.zwidgets.com/js-sdk/1.2/ZohoEmbededAppSDK.min.js
+            The widget degrades gracefully to "standalone mode" when the SDK
+            is unavailable (local preview, blocked CDN, sandbox errors), so
+            the user is never shown a blank screen.
+  ==========================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light" />
+  <title>Weekly Plan</title>
+
+  <!-- IBM Plex Sans (graceful fallback stack is declared in widget.css) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+    onerror="document.documentElement.classList.add('no-webfont')"
+  />
+
+  <link rel="stylesheet" href="widget.css" />
+
+  <!--
+    Zoho Embedded App SDK.
+    onerror flags the failure so widget.js can boot in standalone mode
+    instead of hanging on ZOHO.embeddedApp.init().
+  -->
+  <script
+    src="https://live.zwidgets.com/js-sdk/1.2/ZohoEmbededAppSDK.min.js"
+    onerror="window.__ZOHO_SDK_FAILED__ = true;"
+  ></script>
+</head>
+
+<body>
+  <!--
+    Global crash banner. Rendered above everything, hidden by default and
+    revealed by the error boundary in widget.js. Guarantees the user always
+    sees an explanation + a recovery action instead of an empty widget.
+  -->
+  <div id="globalError" class="global-error" role="alert" hidden>
+    <span class="global-error__icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+        <line x1="12" y1="9" x2="12" y2="13" />
+        <line x1="12" y1="17" x2="12.01" y2="17" />
+      </svg>
+    </span>
+    <div class="global-error__body">
+      <p class="global-error__title">Something went wrong</p>
+      <p class="global-error__text" id="globalErrorText">
+        The widget hit an unexpected error. Your entries on screen are still safe.
+      </p>
+    </div>
+    <button type="button" class="btn btn--ghost btn--sm" id="globalErrorReload">Reload widget</button>
+    <button type="button" class="icon-btn" id="globalErrorDismiss" aria-label="Dismiss message">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+    </button>
+  </div>
+
+  <main class="app" id="app">
+
+    <!-- ============================ HEADER ============================ -->
+    <header class="app-header">
+      <div class="app-header__left">
+        <span class="app-header__mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="17" rx="3" />
+            <path d="M8 2v4M16 2v4M3 10h18" />
+            <path d="m9 15 2 2 4-4" />
+          </svg>
+        </span>
+        <div class="app-header__text">
+          <h1 class="app-header__title">Weekly Plan</h1>
+          <p class="app-header__subtitle">Create your weekly visit plan</p>
+        </div>
+      </div>
+
+      <div class="app-header__right">
+        <div class="week-picker">
+          <label class="week-picker__label" for="weekSelect">Week starting</label>
+          <div class="select-wrap select-wrap--lg">
+            <select id="weekSelect" class="select" aria-label="Select week starting Monday">
+              <!-- Options injected by widget.js -->
+            </select>
+            <span class="select-wrap__chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+                   stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+            </span>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ========================= WEEK SUMMARY ========================= -->
+    <section class="summary" id="summaryBar" aria-live="polite">
+      <div class="summary__range">
+        <span class="summary__range-label">Plan window</span>
+        <strong class="summary__range-value" id="summaryRange">&mdash;</strong>
+      </div>
+      <div class="summary__stats">
+        <div class="stat">
+          <span class="stat__dot stat__dot--school" aria-hidden="true"></span>
+          <span class="stat__value" id="statSchools">0</span>
+          <span class="stat__label">Schools</span>
+        </div>
+        <div class="stat">
+          <span class="stat__dot stat__dot--dealer" aria-hidden="true"></span>
+          <span class="stat__value" id="statDealers">0</span>
+          <span class="stat__label">Dealers</span>
+        </div>
+        <div class="stat">
+          <span class="stat__dot stat__dot--days" aria-hidden="true"></span>
+          <span class="stat__value" id="statDays">0</span>
+          <span class="stat__label">Days planned</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- =========================== DAY GRID =========================== -->
+    <!-- Skeleton placeholders keep the surface populated while booting -->
+    <section class="day-grid" id="dayGrid" aria-live="polite">
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+    </section>
+
+    <!-- Fallback surface when no week can be resolved (never a blank body) -->
+    <section class="fallback" id="fallbackPanel" hidden>
+      <span class="fallback__icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.6"
+             stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="17" rx="3" />
+          <path d="M8 2v4M16 2v4M3 10h18" />
+        </svg>
+      </span>
+      <h2 class="fallback__title" id="fallbackTitle">No week selected</h2>
+      <p class="fallback__text" id="fallbackText">
+        Pick a week from the dropdown above to start planning your visits.
+      </p>
+      <button type="button" class="btn btn--primary btn--sm" id="fallbackRetry">Try again</button>
+    </section>
+
+    <!-- ============================ FOOTER ============================ -->
+    <footer class="app-footer">
+      <p class="app-footer__hint" id="footerHint">
+        Add schools and dealers to each day, then save your plan.
+      </p>
+      <div class="app-footer__actions">
+        <button type="button" class="btn btn--ghost" id="resetBtn">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+          </svg>
+          Reset
+        </button>
+        <button type="button" class="btn btn--primary" id="saveBtn">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+            <path d="M17 21v-8H7v8M7 3v5h8" />
+          </svg>
+          Save Weekly Plan
+        </button>
+      </div>
+    </footer>
+  </main>
+
+  <!-- =========================== TOASTS ============================== -->
+  <div class="toast-stack" id="toastStack" role="status" aria-live="polite" aria-atomic="false"></div>
+
+  <!-- ======================= CONFIRM DIALOG ========================== -->
+  <div class="modal" id="confirmModal" hidden>
+    <div class="modal__backdrop" data-close-modal></div>
+    <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="confirmTitle"
+         aria-describedby="confirmText">
+      <div class="modal__icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+        </svg>
+      </div>
+      <h2 class="modal__title" id="confirmTitle">Reset this week?</h2>
+      <p class="modal__text" id="confirmText">
+        All schools and dealers added for this week will be removed. This cannot be undone.
+      </p>
+      <div class="modal__actions">
+        <button type="button" class="btn btn--ghost" id="confirmCancel">Cancel</button>
+        <button type="button" class="btn btn--danger" id="confirmAccept">Yes, reset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================================================================
+       TEMPLATES
+       Cloned by widget.js. Keeping markup declarative here keeps the JS
+       rendering layer small, reusable and easy to restyle.
+       ================================================================== -->
+
+  <!-- One day card (Monday .. Saturday) -->
+  <template id="tplDayCard">
+    <article class="day-card" data-day-card>
+      <header class="day-card__head">
+        <div class="day-card__id">
+          <span class="day-card__initial" data-day-initial aria-hidden="true"></span>
+          <div>
+            <h3 class="day-card__name" data-day-name></h3>
+            <p class="day-card__date" data-day-date></p>
+          </div>
+        </div>
+        <span class="badge badge--muted" data-day-badge>No Plans</span>
+      </header>
+
+      <!-- Schedule status: Active unlocks the day, Holiday / Leave lock it -->
+      <div class="day-card__status">
+        <span class="day-card__status-label">Schedule status</span>
+        <div class="select-wrap select-wrap--sm">
+          <select class="select select--status" data-day-status></select>
+          <span class="select-wrap__chevron" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+          </span>
+        </div>
+        <p class="day-card__status-note" data-status-note hidden></p>
+      </div>
+
+      <div class="day-card__body">
+        <div class="empty-day" data-empty-day>
+          <span class="empty-day__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9" /><path d="M12 8v4l2.5 2.5" />
+            </svg>
+          </span>
+          <p class="empty-day__text">Required — add at least one School or Dealer for this Active day.</p>
+        </div>
+
+        <!-- Schools -->
+        <section class="group" data-group="school" hidden>
+          <div class="group__head">
+            <span class="group__title">
+              <span class="group__dot group__dot--school" aria-hidden="true"></span>
+              Schools
+            </span>
+            <span class="group__count" data-group-count>0</span>
+          </div>
+          <div class="group__rows" data-rows></div>
+        </section>
+
+        <!-- Dealers -->
+        <section class="group" data-group="dealer" hidden>
+          <div class="group__head">
+            <span class="group__title">
+              <span class="group__dot group__dot--dealer" aria-hidden="true"></span>
+              Dealers
+            </span>
+            <span class="group__count" data-group-count>0</span>
+          </div>
+          <div class="group__rows" data-rows></div>
+        </section>
+      </div>
+
+      <footer class="day-card__foot">
+        <button type="button" class="btn btn--soft btn--sm" data-action="add-entry" data-type="school">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"
+               stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          Add School
+        </button>
+        <button type="button" class="btn btn--soft btn--sm" data-action="add-entry" data-type="dealer">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"
+               stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          Add Dealer
+        </button>
+        <button type="button" class="btn btn--link btn--sm day-card__clear" data-action="clear-day" hidden>
+          Clear day
+        </button>
+      </footer>
+    </article>
+  </template>
+
+  <!-- One entry row (School or Dealer) -->
+  <template id="tplEntryRow">
+    <div class="entry-row" data-entry-row>
+      <div class="entry-row__field">
+        <div class="input-wrap">
+          <span class="input-wrap__icon" data-entry-icon aria-hidden="true"></span>
+          <input
+            type="text"
+            class="input"
+            data-entry-input="name"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="120"
+            placeholder="Enter name"
+          />
+        </div>
+      </div>
+
+      <div class="entry-row__reason">
+        <div class="select-wrap">
+          <select class="select" data-entry-input="reason" aria-label="Purpose of visit"></select>
+          <span class="select-wrap__chevron" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+          </span>
+        </div>
+      </div>
+
+      <div class="entry-row__transport">
+        <div class="select-wrap">
+          <select class="select" data-entry-input="transport" aria-label="Transport medium for this visit"></select>
+          <span class="select-wrap__chevron" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+          </span>
+        </div>
+      </div>
+
+      <button type="button" class="icon-btn icon-btn--danger" data-action="delete-entry"
+              aria-label="Delete this row" title="Delete">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+          <path d="M10 11v6M14 11v6" />
+        </svg>
+      </button>
+
+      <p class="entry-row__error" data-entry-error hidden></p>
+    </div>
+  </template>
+
+  <script src="widget.js"></script>
+</body>
+</html>
