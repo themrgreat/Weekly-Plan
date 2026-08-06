@@ -8,8 +8,7 @@ console.clear();
      Log            console wrapper with a widget prefix
      Boundary       global error boundary -> never leaves a blank surface
      DateUtil       pure date helpers (next-3-Mondays logic lives here)
-     Store          single source of truth + per-week draft cache
-     Persistence    optional, fully guarded localStorage draft persistence
+     Store          single source of truth + per-week draft cache (in-memory only)
      Validator      duplicate / empty / unlinked checks
      Lookup         CRM record search (Accounts / Vendors) + result cache
      Holidays       CRM business holidays -> auto-lock matching days
@@ -73,8 +72,8 @@ console.clear();
     DAYS_PER_WEEK: 6,          // Monday .. Saturday (Sunday excluded)
     MAX_ROWS_PER_TYPE: 25,     // safety cap per day / per type
     SDK_TIMEOUT_MS: 5000,      // stop waiting on the SDK after this
-    STORAGE_KEY: 'zcrm.weeklyPlan.draft.v2',   // v2: entries carry recordId
     TOAST_TIMEOUT_MS: 3800,
+    WIDGET_CLOSE_DELAY_MS: 1500,   // let the success toast be seen before auto-closing
 
     /* Lookup autocomplete */
     SEARCH_DEBOUNCE_MS: 280,   // keystroke -> CRM search
@@ -85,6 +84,7 @@ console.clear();
     /* CRM write targets (module API names, not display labels) */
     PLANNER_MODULE: 'Weekly_Planner',
     PLANNER_SUBFORM: 'Plan_Details',
+    PLANNER_DEFAULT_STATUS: 'Draft',   // Status (api name: Status) picklist default on create
     MEETING_MODULE: 'Meeting_Planned',
     /* Lookup on Meeting_Planned that points back at the Weekly_Planner record */
     MEETING_PLANNER_LOOKUP: 'Weekly_Planner',
@@ -372,57 +372,6 @@ console.clear();
   })();
 
   /* ======================================================================
-     PERSISTENCE - guarded localStorage draft cache
-     Never fatal: sandboxed iframes may block storage entirely.
-     ====================================================================== */
-
-  var Persistence = {
-    _available: null,
-
-    isAvailable: function () {
-      if (this._available !== null) { return this._available; }
-      try {
-        var probe = '__wp_probe__';
-        window.localStorage.setItem(probe, '1');
-        window.localStorage.removeItem(probe);
-        this._available = true;
-      } catch (e) {
-        Log.warn('Local storage unavailable; drafts stay in memory only.');
-        this._available = false;
-      }
-      return this._available;
-    },
-
-    load: function () {
-      if (!this.isAvailable()) { return {}; }
-      try {
-        var raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
-        if (!raw) { return {}; }
-        var parsed = JSON.parse(raw);
-        return (parsed && typeof parsed === 'object') ? parsed : {};
-      } catch (e) {
-        Log.warn('Draft cache unreadable, starting clean.', e);
-        this.clearAll();
-        return {};
-      }
-    },
-
-    save: function (drafts) {
-      if (!this.isAvailable()) { return; }
-      try {
-        window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(drafts || {}));
-      } catch (e) {
-        Log.warn('Draft could not be persisted (quota or policy).', e);
-      }
-    },
-
-    clearAll: function () {
-      if (!this.isAvailable()) { return; }
-      try { window.localStorage.removeItem(CONFIG.STORAGE_KEY); } catch (e) { /* ignore */ }
-    }
-  };
-
-  /* ======================================================================
      STORE - single source of truth
      ====================================================================== */
 
@@ -546,23 +495,13 @@ console.clear();
       state.drafts[state.selectedWeekId] = JSON.parse(JSON.stringify(state.days));
     },
 
-    /** Persist all drafts (current week included). */
+    /** Cache all in-memory drafts (current week included). Session-only, never touches disk. */
     persist: function () {
       try {
         this.cacheCurrentWeek();
-        Persistence.save(state.drafts);
       } catch (err) {
         Log.warn('Persist skipped:', err);
       }
-    },
-
-    /** Drop drafts for weeks that are no longer offered (e.g. after a week rolls over). */
-    pruneDrafts: function () {
-      var valid = {};
-      state.weeks.forEach(function (w) { valid[w.id] = true; });
-      Object.keys(state.drafts).forEach(function (key) {
-        if (!valid[key]) { delete state.drafts[key]; }
-      });
     },
 
     getDay: function (dayId) {
@@ -775,6 +714,102 @@ console.clear();
         map[iso] = { date: iso, name: String(row.name || 'Business holiday') };
       });
       this._byDate = map;
+    }
+  };
+
+  /* ======================================================================
+     PLANNER LOCK - detect a Weekly_Planner this user already created
+
+     On open, one search per visible week checks Weekly_Planner for a record
+     whose Name is that week's range label ("10 Aug 2026 – 15 Aug 2026") AND
+     whose Owner is the signed-in user. A hit means this user already planned
+     that week, so it is disabled in the dropdown instead of re-created.
+
+     The Owner filter is the standard lookup every module already carries —
+     no custom field needed — which is what keeps the match scoped to the
+     current user even though multiple people create Weekly_Planner records
+     with names that otherwise collide (everyone's week starts the same
+     Monday).  A failure here is never fatal: the week just stays selectable.
+     ====================================================================== */
+
+  var PlannerLock = {
+    _byWeek: {},   // weekId -> Weekly_Planner id this user already created
+    _loaded: false,
+
+    isLoaded: function () { return this._loaded; },
+    isLocked: function (weekId) { return this._byWeek.hasOwnProperty(weekId); },
+    plannerIdFor: function (weekId) { return this._byWeek[weekId] || ''; },
+
+    _canSearch: function () {
+      return !!(state.sdkConnected && window.ZOHO && window.ZOHO.CRM &&
+                window.ZOHO.CRM.API && typeof window.ZOHO.CRM.API.searchRecord === 'function');
+    },
+
+    /** Current user's CRM record id, or '' when the SDK cannot provide one. */
+    currentUserId: function () {
+      if (!(state.sdkConnected && window.ZOHO && window.ZOHO.CRM && window.ZOHO.CRM.CONFIG &&
+            typeof window.ZOHO.CRM.CONFIG.getCurrentUser === 'function')) {
+        return Promise.resolve('');
+      }
+      try {
+        return window.ZOHO.CRM.CONFIG.getCurrentUser().then(function (response) {
+          var user = response && response.users && response.users[0];
+          return (user && user.id) ? String(user.id) : '';
+        }).catch(function (err) {
+          Log.warn('getCurrentUser failed:', err);
+          return '';
+        });
+      } catch (err) {
+        Log.warn('getCurrentUser threw:', err);
+        return Promise.resolve('');
+      }
+    },
+
+    /**
+     * One Name+Owner search per week. Always resolves.
+     * @returns {Promise<{status:string}>}
+     */
+    loadForWeeks: function (weeks) {
+      var self = this;
+      if (!this._canSearch() || !weeks || !weeks.length) {
+        return Promise.resolve({ status: 'skipped' });
+      }
+      return this.currentUserId().then(function (ownerId) {
+        if (!ownerId) { return { status: 'skipped' }; }
+        return Promise.all(weeks.map(function (week) {
+          return self._searchWeek(week, ownerId);
+        })).then(function () {
+          self._loaded = true;
+          return { status: 'ok' };
+        });
+      });
+    },
+
+    _searchWeek: function (week, ownerId) {
+      var self = this;
+      var name = App.rangeNameForWeek(week);
+      var criteria = '((Name:equals:' + name + ')and(Owner:equals:' + ownerId + '))';
+
+      try {
+        return window.ZOHO.CRM.API.searchRecord({
+          Entity: CONFIG.PLANNER_MODULE,
+          Type: 'criteria',
+          Query: criteria,
+          delay: false
+        }).then(function (response) {
+          var rows = (response && Array.isArray(response.data)) ? response.data : [];
+          if (rows.length && rows[0] && rows[0].id) {
+            self._byWeek[week.id] = String(rows[0].id);
+          }
+        }).catch(function (err) {
+          // Zoho resolves "no match" without a data array; this net only
+          // catches genuine transport failures, which must not block the UI.
+          Log.warn('Planner lookup failed for ' + week.id + ':', err);
+        });
+      } catch (err) {
+        Log.warn('Planner lookup threw for ' + week.id + ':', err);
+        return Promise.resolve();
+      }
     }
   };
 
@@ -1451,7 +1486,8 @@ console.clear();
 
     /* --------------------------- week dropdown --------------------------- */
 
-    renderWeekOptions: function (weeks, selectedId) {
+    /** @param {?Object} lock PlannerLock (or omitted before that check has run) */
+    renderWeekOptions: function (weeks, selectedId, lock) {
       var select = this.els.weekSelect;
       if (!select) { return; }
       Dom.clear(select);
@@ -1469,7 +1505,9 @@ console.clear();
       weeks.forEach(function (week) {
         var option = document.createElement('option');
         option.value = week.id;
-        option.textContent = week.label;      // exactly "04 Aug"
+        var locked = !!(lock && lock.isLocked(week.id));
+        option.textContent = week.label + (locked ? ' — already planned' : ''); // "04 Aug" or "04 Aug — already planned"
+        option.disabled = locked;
         select.appendChild(option);
       });
       select.value = selectedId || weeks[0].id;
@@ -1882,8 +1920,7 @@ console.clear();
           return;
         }
 
-        state.drafts = Persistence.load();
-        Store.pruneDrafts();
+        state.drafts = {};
 
         View.renderWeekOptions(weeks, weeks[0].id);
         this.loadWeek(weeks[0].id);
@@ -1947,6 +1984,7 @@ console.clear();
             Log.info('Zoho Embedded App SDK ready.');
             self.resizeWidget();
             self.loadHolidays();
+            self.loadPlannerLocks();
           })
           .catch(function (err) {
             if (settled) { return; }
@@ -2023,6 +2061,52 @@ console.clear();
       return changed;
     },
 
+    /**
+     * Checks every visible week against Weekly_Planner (Name + Owner) so a
+     * week this user already saved cannot be picked and re-created. Runs
+     * once after the SDK connects; a failure here just leaves every week
+     * selectable, same as before the check existed.
+     */
+    loadPlannerLocks: function () {
+      return PlannerLock.loadForWeeks(state.weeks).then(Boundary.guard(function (result) {
+        if (result.status === 'ok') { App.applyPlannerLocks(); }
+        return result;
+      }, 'load-planner-locks'));
+    },
+
+    /** Disable locked weeks in the dropdown and hop off one if it is currently selected. */
+    applyPlannerLocks: function () {
+      var lockedCount = state.weeks.reduce(function (count, week) {
+        return count + (PlannerLock.isLocked(week.id) ? 1 : 0);
+      }, 0);
+      if (!lockedCount) { return; }
+
+      state.weeks.forEach(function (week) {
+        if (PlannerLock.isLocked(week.id)) {
+          state.createdPlanners[week.id] = PlannerLock.plannerIdFor(week.id);
+        }
+      });
+
+      View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
+      Toast.info(lockedCount + ' week' + (lockedCount === 1 ? '' : 's') + ' already planned',
+        'You already created a weekly plan for ' + (lockedCount === 1 ? 'that week' : 'those weeks') + '.');
+
+      if (!PlannerLock.isLocked(state.selectedWeekId)) { return; }
+
+      var open = null;
+      for (var i = 0; i < state.weeks.length; i++) {
+        if (!PlannerLock.isLocked(state.weeks[i].id)) { open = state.weeks[i]; break; }
+      }
+
+      if (open) {
+        this.loadWeek(open.id);
+        if (View.els.weekSelect) { View.els.weekSelect.value = open.id; }
+      } else {
+        View.showFallback('All upcoming weeks are already planned',
+          'You have already created a weekly plan for every week shown here.');
+      }
+    },
+
     /** Best-effort widget resize; silently ignored outside CRM. */
     resizeWidget: function () {
       try {
@@ -2032,6 +2116,30 @@ console.clear();
       } catch (err) {
         Log.warn('Resize unsupported here.', err);
       }
+    },
+
+    /**
+     * The record is already safely in CRM at this point, so there is nothing
+     * left for the widget to do — close it instead of leaving the user to
+     * find their own way back. The delay lets the success toast be seen.
+     * closeReload (when available) also refreshes the page behind it so any
+     * related list picks up the new record; close() is the fallback.
+     */
+    closeWidget: function () {
+      window.setTimeout(function () {
+        try {
+          var popup = window.ZOHO && window.ZOHO.CRM && window.ZOHO.CRM.UI && window.ZOHO.CRM.UI.Popup;
+          if (popup && typeof popup.closeReload === 'function') {
+            popup.closeReload();
+          } else if (popup && typeof popup.close === 'function') {
+            popup.close();
+          } else {
+            Log.warn('No widget close API available in this context.');
+          }
+        } catch (err) {
+          Log.warn('Widget close failed:', err);
+        }
+      }, CONFIG.WIDGET_CLOSE_DELAY_MS);
     },
 
     /* ------------------------------ events ------------------------------- */
@@ -2409,7 +2517,12 @@ console.clear();
      */
     plannerName: function () {
       var week = Store.getWeek(state.selectedWeekId);
-      if (!week) { return state.selectedWeekId; }
+      return week ? this.rangeNameForWeek(week) : state.selectedWeekId;
+    },
+
+    /** Same "03 Aug 2026 – 08 Aug 2026" label, for any week (not just the selected one). */
+    rangeNameForWeek: function (week) {
+      if (!week) { return ''; }
       var saturday = DateUtil.addDays(week.date, CONFIG.DAYS_PER_WEEK - 1);
       return DateUtil.longLabel(week.date) + ' – ' + DateUtil.longLabel(saturday);
     },
@@ -2448,7 +2561,7 @@ console.clear();
         });
       });
 
-      var record = { Name: this.plannerName() };
+      var record = { Name: this.plannerName(), Status: CONFIG.PLANNER_DEFAULT_STATUS };
       record[CONFIG.PLANNER_SUBFORM] = rows;
       return record;
     },
@@ -2637,6 +2750,7 @@ console.clear();
             CONFIG.MEETING_MODULE + ' record' + (result.ids.length === 1 ? '' : 's') + ' created.');
           View.setHint('Created planner ' + plannerId + ' with ' + result.ids.length +
             ' meeting record' + (result.ids.length === 1 ? '' : 's') + '.', false);
+          App.closeWidget();
         }, 'submit-done'))
         .catch(Boundary.guard(function (err) {
           var message = Boundary.describe(err);
@@ -2687,6 +2801,7 @@ console.clear();
     Lookup: Lookup,
     Suggest: Suggest,
     Holidays: Holidays,
+    PlannerLock: PlannerLock,
     Crm: Crm,
     View: View,
     App: App,
