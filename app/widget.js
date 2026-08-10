@@ -131,6 +131,9 @@ console.clear();
   var STATUS_LEAVE = 'Leave';
   var SCHEDULE_STATUSES = [STATUS_ACTIVE, STATUS_HOLIDAY, STATUS_LEAVE];
 
+  /* Weekly_Planner Status picklist value that does NOT block re-creation. */
+  var PLANNER_STATUS_REJECTED = 'Reject';
+
   var DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   var MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -730,15 +733,33 @@ console.clear();
      current user even though multiple people create Weekly_Planner records
      with names that otherwise collide (everyone's week starts the same
      Monday).  A failure here is never fatal: the week just stays selectable.
+
+     A matching record only blocks re-creation while its Status is something
+     other than "Rejected". A rejected plan is not "already planned" in any
+     meaningful sense, so if every match for a week is Rejected the week stays
+     open; a single non-Rejected match (Draft, Pending, Approved, ...) is
+     enough to lock it.
      ====================================================================== */
 
   var PlannerLock = {
-    _byWeek: {},   // weekId -> Weekly_Planner id this user already created
+    _byWeek: {},           // weekId -> Weekly_Planner id this user already created
+    _createdThisSession: {}, // weekId -> true; a fresh search must never override these
     _loaded: false,
 
     isLoaded: function () { return this._loaded; },
     isLocked: function (weekId) { return this._byWeek.hasOwnProperty(weekId); },
     plannerIdFor: function (weekId) { return this._byWeek[weekId] || ''; },
+    isCreatedThisSession: function (weekId) { return !!this._createdThisSession[weekId]; },
+
+    /** Lock a week immediately after this session creates its planner, so the
+     *  dropdown reflects it without waiting on a fresh CRM search. This lock
+     *  is authoritative: search results (which can lag right after an
+     *  insert) are never allowed to clear it — see _searchWeek. */
+    markCreated: function (weekId, plannerId) {
+      this._byWeek[weekId] = String(plannerId || '');
+      this._createdThisSession[weekId] = true;
+      this._loaded = true;
+    },
 
     _canSearch: function () {
       return !!(state.sdkConnected && window.ZOHO && window.ZOHO.CRM &&
@@ -787,6 +808,12 @@ console.clear();
 
     _searchWeek: function (week, ownerId) {
       var self = this;
+
+      // This session's own create is authoritative — a re-search right after
+      // an insert can lag CRM's search index and come back empty, which must
+      // never be read as "actually not locked".
+      if (this._createdThisSession[week.id]) { return Promise.resolve(); }
+
       var name = App.rangeNameForWeek(week);
       var criteria = '((Name:equals:' + name + ')and(Owner:equals:' + ownerId + '))';
 
@@ -795,11 +822,29 @@ console.clear();
           Entity: CONFIG.PLANNER_MODULE,
           Type: 'criteria',
           Query: criteria,
+          // Status must be requested explicitly — searchRecord's default field
+          // set is not guaranteed to include every picklist on the layout, and
+          // the Reject check below is worthless against an undefined Status.
+          Fields: ['Status'],
           delay: false
         }).then(function (response) {
           var rows = (response && Array.isArray(response.data)) ? response.data : [];
-          if (rows.length && rows[0] && rows[0].id) {
-            self._byWeek[week.id] = String(rows[0].id);
+          // Every matching record for this Name+Owner must be inspected, not
+          // just the first one: several Reject records plus a single
+          // Pending/Approved/Draft one still lock the week. Re-evaluated fresh
+          // on every call, so a week that was locked before now correctly
+          // reopens once every match is Reject (or the record was deleted).
+          var lockedId = '';
+          for (var i = 0; i < rows.length; i++) {
+            if (rows[i] && rows[i].id && rows[i].Status !== PLANNER_STATUS_REJECTED) {
+              lockedId = String(rows[i].id);
+              break;
+            }
+          }
+          if (lockedId) {
+            self._byWeek[week.id] = lockedId;
+          } else {
+            delete self._byWeek[week.id];
           }
         }).catch(function (err) {
           // Zoho resolves "no match" without a data array; this net only
@@ -1802,11 +1847,18 @@ console.clear();
       }
     },
 
-    /** A week that is all holiday / leave is still worth recording. Every Active day, though, needs at least one visit. */
+    /**
+     * A week that is all holiday / leave is still worth recording. Every
+     * Active day, though, needs at least one visit. A week whose planner was
+     * already created this session stays disabled even if the user starts
+     * typing into the (now empty) form again — otherwise Save would create a
+     * second Weekly_Planner for the same week.
+     */
     refreshSaveEnabled: function () {
       if (!this.els.saveBtn) { return; }
       var totals = Store.totals();
-      var saveable = (totals.entries > 0 || totals.offDays > 0) && totals.incompleteDays === 0;
+      var alreadyCreated = !!state.createdPlanners[state.selectedWeekId];
+      var saveable = !alreadyCreated && (totals.entries > 0 || totals.offDays > 0) && totals.incompleteDays === 0;
       this.els.saveBtn.disabled = !saveable || state.submitting;
     },
 
@@ -1885,6 +1937,10 @@ console.clear();
     hideFallback: function () {
       Dom.hide(this.els.fallback);
       Dom.show(this.els.dayGrid);
+    },
+
+    isFallbackVisible: function () {
+      return !!(this.els.fallback && !this.els.fallback.hidden);
     }
   };
 
@@ -1922,9 +1978,20 @@ console.clear();
 
         state.drafts = {};
 
-        View.renderWeekOptions(weeks, weeks[0].id);
+        View.renderWeekOptions(weeks, weeks[0].id, PlannerLock);
         this.loadWeek(weeks[0].id);
         state.ready = true;
+
+        // bootUI also runs from the "Try again" fallback retry (e.g. after
+        // every visible week showed as already planned), not just the very
+        // first boot. At true startup sdkConnected is still false and this
+        // is a no-op, same as the first PageLoad — but on a retry it must
+        // re-run the same CRM lock check onPageLoad does, or a week that was
+        // never actually re-verified would render as open again.
+        if (state.sdkConnected) {
+          this.loadHolidays();
+          this.loadPlannerLocks();
+        }
       } catch (err) {
         Boundary.report(err, 'bootUI');
         View.showFallback('Widget could not start',
@@ -1971,8 +2038,13 @@ console.clear();
 
       try {
         // PageLoad must be subscribed BEFORE init() or the event is missed.
+        // Zoho refires PageLoad on every widget refresh, not just the first
+        // load, so this is also the hook that re-runs the planner-lock check
+        // — without it, a refresh would let a user re-create a record for a
+        // week already planned.
         window.ZOHO.embeddedApp.on('PageLoad', Boundary.guard(function (data) {
           Log.info('PageLoad', data);
+          self.onPageLoad();
         }, 'PageLoad'));
 
         window.ZOHO.embeddedApp.init()
@@ -2074,37 +2146,75 @@ console.clear();
       }, 'load-planner-locks'));
     },
 
-    /** Disable locked weeks in the dropdown and hop off one if it is currently selected. */
+    /**
+     * Disable locked weeks in the dropdown and hop off one if it is currently
+     * selected. Runs after every fresh search (initial load, Zoho's refresh,
+     * and the "Try again" retry alike), so this also has to UNLOCK a week
+     * whose only matching record(s) turned out to be Reject — otherwise a
+     * week checked once would stay stuck behind a stale lock forever,
+     * including the "all weeks already planned" fallback never clearing.
+     */
     applyPlannerLocks: function () {
-      var lockedCount = state.weeks.reduce(function (count, week) {
-        return count + (PlannerLock.isLocked(week.id) ? 1 : 0);
-      }, 0);
-      if (!lockedCount) { return; }
+      var lockedCount = 0;
+      var reopened = false;
 
       state.weeks.forEach(function (week) {
         if (PlannerLock.isLocked(week.id)) {
           state.createdPlanners[week.id] = PlannerLock.plannerIdFor(week.id);
+          lockedCount++;
+        } else if (state.createdPlanners.hasOwnProperty(week.id)) {
+          // Was locked, isn't anymore (e.g. every match is now Reject) — the
+          // session-created case can't reach here since PlannerLock.isLocked
+          // stays true for those (see PlannerLock.markCreated).
+          delete state.createdPlanners[week.id];
+          reopened = true;
         }
       });
 
       View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
-      Toast.info(lockedCount + ' week' + (lockedCount === 1 ? '' : 's') + ' already planned',
-        'You already created a weekly plan for ' + (lockedCount === 1 ? 'that week' : 'those weeks') + '.');
-
-      if (!PlannerLock.isLocked(state.selectedWeekId)) { return; }
-
-      var open = null;
-      for (var i = 0; i < state.weeks.length; i++) {
-        if (!PlannerLock.isLocked(state.weeks[i].id)) { open = state.weeks[i]; break; }
+      if (lockedCount) {
+        Toast.info(lockedCount + ' week' + (lockedCount === 1 ? '' : 's') + ' already planned',
+          'You already created a weekly plan for ' + (lockedCount === 1 ? 'that week' : 'those weeks') + '.');
       }
 
-      if (open) {
-        this.loadWeek(open.id);
-        if (View.els.weekSelect) { View.els.weekSelect.value = open.id; }
+      if (PlannerLock.isLocked(state.selectedWeekId)) {
+        var open = null;
+        for (var i = 0; i < state.weeks.length; i++) {
+          if (!PlannerLock.isLocked(state.weeks[i].id)) { open = state.weeks[i]; break; }
+        }
+
+        if (open) {
+          this.loadWeek(open.id);
+          if (View.els.weekSelect) { View.els.weekSelect.value = open.id; }
+        } else {
+          View.showFallback('All upcoming weeks are already planned',
+            'You have already created a weekly plan for every week shown here.');
+        }
+        return;
+      }
+
+      // Selected week is open. If it just reopened (or the fallback panel is
+      // still showing from before), get its actual form back on screen.
+      if (reopened || View.isFallbackVisible()) {
+        this.loadWeek(state.selectedWeekId);
       } else {
-        View.showFallback('All upcoming weeks are already planned',
-          'You have already created a weekly plan for every week shown here.');
+        View.refreshSaveEnabled();
       }
+    },
+
+    /**
+     * Fires on every Zoho widget refresh (not just the first load). The initial
+     * PageLoad arrives before embeddedApp.init() resolves, so sdkConnected is
+     * still false then and this is a no-op — the init().then() flow already
+     * runs the first planner-lock check. Once sdkConnected is true, any later
+     * PageLoad means the user refreshed, so the same check must run again or
+     * a week already planned would silently become creatable.
+     */
+    onPageLoad: function () {
+      if (!state.sdkConnected) { return; }
+      Log.info('Widget refreshed - re-validating planner locks.');
+      this.loadHolidays();
+      this.loadPlannerLocks();
     },
 
     /** Best-effort widget resize; silently ignored outside CRM. */
@@ -2663,50 +2773,90 @@ console.clear();
         return;
       }
 
-      // Trim stored names so the saved payload is clean.
-      state.days.forEach(function (day) {
-        ['schools', 'dealers'].forEach(function (key) {
-          day[key].forEach(function (entry) {
-            entry.name = String(entry.name || '').trim().replace(/\s+/g, ' ');
+      var week = Store.getWeek(state.selectedWeekId);
+
+      // The PlannerLock dropdown check runs on load and on every widget
+      // refresh, but a click can land before that background search finishes
+      // (or before a refresh has even happened). Re-verify against CRM right
+      // here, at the moment records would actually be written, instead of
+      // trusting whatever state.createdPlanners happened to hold when the
+      // Save button was last drawn — that is what let a refreshed widget
+      // create a second record for an already-planned week.
+      state.submitting = true;
+      View.refreshSaveEnabled();
+
+      App.recheckPlannerLock(week).then(Boundary.guard(function (locked) {
+        state.submitting = false;
+        View.refreshSaveEnabled();
+
+        if (locked) {
+          View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
+          Toast.error('Already planned',
+            'A ' + CONFIG.PLANNER_MODULE + ' record already exists for this week — it cannot be created again.');
+          View.setHint('This week already has a ' + CONFIG.PLANNER_MODULE +
+            ' record. Pick a different week.', true);
+          return;
+        }
+
+        // Trim stored names so the saved payload is clean.
+        state.days.forEach(function (day) {
+          ['schools', 'dealers'].forEach(function (key) {
+            day[key].forEach(function (entry) {
+              entry.name = String(entry.name || '').trim().replace(/\s+/g, ' ');
+            });
           });
         });
-      });
 
-      Store.persist();
+        Store.persist();
 
-      var planner = App.buildPlannerRecord();
-      var meetings = App.buildMeetingRecords();
+        var planner = App.buildPlannerRecord();
+        var meetings = App.buildMeetingRecords();
 
-      Log.info('Weekly Planner payload', planner);
-      Log.info('Meeting Planned payload (' + meetings.length + ' record(s))', meetings);
+        Log.info('Weekly Planner payload', planner);
+        Log.info('Meeting Planned payload (' + meetings.length + ' record(s))', meetings);
 
-      if (!Crm.isReady()) {
-        // Outside CRM there is nothing to write to; log so the shape is checkable.
-        Toast.warning('Not connected to CRM',
-          'The plan was validated and logged to the console, but no records were created.');
-        View.setHint('Not connected to CRM — nothing was created.', true);
-        return;
-      }
+        if (!Crm.isReady()) {
+          // Outside CRM there is nothing to write to; log so the shape is checkable.
+          Toast.warning('Not connected to CRM',
+            'The plan was validated and logged to the console, but no records were created.');
+          View.setHint('Not connected to CRM — nothing was created.', true);
+          return;
+        }
 
-      var summary = [
-        totals.entries + ' visit' + (totals.entries === 1 ? '' : 's')
-      ];
-      if (totals.offDays) {
-        summary.push(totals.offDays + ' holiday/leave day' + (totals.offDays === 1 ? '' : 's'));
-      }
+        var summary = [
+          totals.entries + ' visit' + (totals.entries === 1 ? '' : 's')
+        ];
+        if (totals.offDays) {
+          summary.push(totals.offDays + ' holiday/leave day' + (totals.offDays === 1 ? '' : 's'));
+        }
 
-      var already = state.createdPlanners[state.selectedWeekId];
-      var question = already
-        ? 'This week was already saved once (planner ' + already + '). Saving again creates a second set of records.'
-        : 'This creates 1 ' + CONFIG.PLANNER_MODULE + ' record and ' + meetings.length + ' ' +
+        var question = 'This creates 1 ' + CONFIG.PLANNER_MODULE + ' record and ' + meetings.length + ' ' +
           CONFIG.MEETING_MODULE + ' record' + (meetings.length === 1 ? '' : 's') + ' — ' +
           summary.join(', ') + '.';
 
-      Modal.confirm(already ? 'Save this week again?' : 'Create weekly plan?',
-        question, already ? 'Yes, save again' : 'Yes, create records', 'primary')
-        .then(Boundary.guard(function (ok) {
-          if (ok) { App.submit(planner, meetings); }
-        }, 'save-confirm'));
+        Modal.confirm('Create weekly plan?', question, 'Yes, create records', 'primary')
+          .then(Boundary.guard(function (ok) {
+            if (ok) { App.submit(planner, meetings); }
+          }, 'save-confirm'));
+      }, 'save-lock-check'));
+    },
+
+    /**
+     * Live, single-week PlannerLock re-check. A week already known-locked in
+     * this session short-circuits without a network call; otherwise this
+     * queries CRM directly (Name + Owner, same as the background check) so
+     * Save is never gated purely by whether a refresh happened to run.
+     * @returns {Promise<boolean>} true when the week is already planned
+     */
+    recheckPlannerLock: function (week) {
+      if (!week) { return Promise.resolve(false); }
+      if (state.createdPlanners[week.id]) { return Promise.resolve(true); }
+
+      return PlannerLock.loadForWeeks([week]).then(function () {
+        if (!PlannerLock.isLocked(week.id)) { return false; }
+        state.createdPlanners[week.id] = PlannerLock.plannerIdFor(week.id);
+        return true;
+      });
     },
 
     /**
@@ -2732,11 +2882,17 @@ console.clear();
           return Crm.insertMany(CONFIG.MEETING_MODULE, meetings);
         })
         .then(Boundary.guard(function (result) {
-          state.createdPlanners[state.selectedWeekId] = plannerId;
+          var weekId = state.selectedWeekId;
+          state.createdPlanners[weekId] = plannerId;
+          // Lock the week immediately (refreshSaveEnabled reads this) so Save
+          // cannot fire again for it even if closeWidget() cannot actually
+          // close the popup here (e.g. standalone/dev preview).
+          PlannerLock.markCreated(weekId, plannerId);
 
           if (result.errors.length) {
             // The planner exists but some meetings did not make it — say so
-            // plainly rather than reporting a clean success.
+            // plainly rather than reporting a clean success. The form is left
+            // as-is so the user can see what was entered while it failed.
             Log.error('Meeting insert errors:', result.errors);
             Toast.error('Planner created, ' + result.errors.length + ' meeting(s) failed',
               result.errors[0]);
@@ -2744,6 +2900,13 @@ console.clear();
               ' of ' + meetings.length + ' meeting records failed. See the console.', true);
             return;
           }
+
+          // Success: clear the entered data and re-render so the form cannot
+          // be resubmitted for this week, then restore the success hint
+          // (renderWeek's summary refresh would otherwise show the default one).
+          var days = Store.resetWeek();
+          View.renderWeek(days);
+          View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
 
           Toast.success('Weekly plan created',
             CONFIG.PLANNER_MODULE + ' record + ' + result.ids.length + ' ' +
