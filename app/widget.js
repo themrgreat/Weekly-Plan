@@ -7,16 +7,20 @@ console.clear();
 
      Log            console wrapper with a widget prefix
      Boundary       global error boundary -> never leaves a blank surface
-     DateUtil       pure date helpers (next-3-Mondays logic lives here)
+     DateUtil       pure date helpers (next-4-Mondays logic lives here)
      Store          single source of truth + per-week draft cache (in-memory only)
+     Holidays       CRM business holidays -> auto-lock matching days
+     Settings       admin-controlled Current/Previous week access (CRM Variables)
+     Users          active CRM users for Team Member, scoped by Region
+     PlannerLock    detects a Weekly_Planner this user already created
      Validator      duplicate / empty / unlinked checks
      Lookup         CRM record search (Accounts / Vendors) + result cache
-     Holidays       CRM business holidays -> auto-lock matching days
-     Crm            record creation (Weekly_Planner + Meeting_Planned)
      Toast          transient feedback
      Modal          promise based confirm dialog
+     Crm            record creation (Weekly_Planner)
      Suggest        shared autocomplete popover for the lookup inputs
      View           DOM rendering (day cards, entry rows, badges, summary)
+     AdminSettings  admin-only "Schedule access" panel
      App            bootstrap, SDK handshake, event wiring
 
    Module mapping (both fields are CRM lookups, not free text):
@@ -35,28 +39,26 @@ console.clear();
          dayShort:  "Mon",
          dateISO:   "2026-08-03",
          dateLabel: "03 Aug 2026",
-         status:    "Active",                           // Active | Holiday | Leave
+         status:    "Active",                 // Active | Holiday | Leave | Team Working
          holidayName: "",                               // set when locked by CRM
          locked:    false,                              // CRM holiday -> not editable
-         schools:   [{ id, recordId, name, reason, transport }], // recordId -> Accounts
-         dealers:   [{ id, recordId, name, reason, transport }]  // recordId -> Vendors
+         schools:   [{ id, recordId, name, reason, transport }], // recordId -> Accounts, Active only
+         dealers:   [{ id, recordId, name, reason, transport }], // recordId -> Vendors, Active only
+         teamMemberId: ""                               // set only while status is Team Working
        }, ... Saturday
      ]
 
-   Save creates two things (see App.buildPlannerRecord / buildMeetingRecords):
+   Save creates one record (see App.buildPlannerRecord):
 
      Weekly_Planner    1 record. Name is derived ("03 Aug 2026 – 08 Aug
                        2026"). Subform Plan_Details holds one row per visit;
                        a row is single-sided — School_Name OR Dealer_Name, never
                        both — with Purpose, Transport_Medium and Schedule_Status.
                        Holiday / Leave days contribute one status-only row.
-
-     Meeting_Planned   one record per visit, plus one per Holiday / Leave day
-                       (Day_Status mirrors Schedule_Status, no school/dealer
-                       lookups set). Every meeting record — visit or off-day —
-                       carries the Weekly_Planner lookup pointing back at the
-                       planner created in the same save, so the week's meetings
-                       hang off their planner in CRM.
+                       Team Working days contribute one status-only row too,
+                       carrying just Team_Member — School/Dealer never appear
+                       on a Team Working day, so they are neither shown in the
+                       UI nor mandatory to save one.
    ========================================================================== */
 
 (function () {
@@ -85,27 +87,77 @@ console.clear();
     PLANNER_MODULE: 'Weekly_Planner',
     PLANNER_SUBFORM: 'Plan_Details',
     PLANNER_DEFAULT_STATUS: 'Draft',   // Status (api name: Status) picklist default on create
-    MEETING_MODULE: 'Meeting_Planned',
-    /* Lookup on Meeting_Planned that points back at the Weekly_Planner record */
-    MEETING_PLANNER_LOOKUP: 'Weekly_Planner',
-    INSERT_BATCH_MAX: 100,     // insertRecord accepts at most 100 rows per call
 
     /* Business holidays (Deluge equivalent: invokeUrl + connection "zohocrm") */
     HOLIDAY_CONNECTION: 'zohocrm',
-    HOLIDAY_URL: 'https://www.zohoapis.in/crm/v8/settings/holidays'
+    HOLIDAY_URL: 'https://www.zohoapis.in/crm/v8/settings/holidays',
+
+    /**
+     * Admin-controlled Current/Previous week schedule access. Only this CRM
+     * user id sees the "Enable Past Weeks" control. Applies to every user
+     * once enabled — there is no per-user targeting.
+     *
+     * Backed by two plain Checkbox Variables (Setup > Developer Space >
+     * Variables, group api_name "General"), read/written through the same
+     * CONNECTION.invoke pattern as Holidays above — the "zohocrm" connection
+     * must additionally be granted ZohoCRM.settings.variables.ALL. Both
+     * variables must already exist (created manually in the CRM UI); this
+     * widget only reads/updates their value, it does not create them.
+     */
+    ADMIN_USER_ID: '1343779000000459001',
+    SETTINGS_API_DOMAIN: 'https://www.zohoapis.in',
+    SETTINGS_VARIABLE_GROUP: 'General',
+    ENABLE_VARIABLE_NAME: 'isEnable',
+    CURRENT_VARIABLE_NAME: 'isCurrentWeek',
+    PREVIOUS_VARIABLE_NAME: 'isPreviousWeek',
+
+    /**
+     * Team Member - single-user lookup, per day, shown only while that day's
+     * Schedule_Status is "Team Working" (replacing School/Dealer entirely for
+     * that day). Same api name as the Plan_Details subform field it's saved
+     * into (see App.buildPlannerRecord). The active-user list backing the
+     * picklist is fetched once per session via the same CONNECTION.invoke
+     * pattern as Holidays/Settings above.
+     */
+    TEAM_MEMBER_FIELD: 'Team_Member',
+    USERS_URL: 'https://www.zohoapis.in/crm/v8/users?type=ActiveUsers',
+
+    /**
+     * Users module custom field. The Team Member picklist is scoped to only
+     * the signed-in user's own region (see Users.load()) — never shown as a
+     * separate frontend filter, purely a backend narrowing of the same list.
+     *
+     * Fetched via CURRENT_USER_URL, NOT ZOHO.CRM.CONFIG.getCurrentUser() —
+     * getCurrentUser() returns a fixed set of ~27 standard fields and never
+     * includes custom fields, confirmed by inspecting its response in this
+     * CRM org (no Region, no custom field of any kind present).
+     */
+    REGION_FIELD: 'Region',
+    /** Region value meaning "all regions": a user with this region sees every user. */
+    REGION_ALL: 'All',
+    CURRENT_USER_URL: 'https://www.zohoapis.in/crm/v8/users?type=CurrentUser',
+
+    /**
+     * Global Multi-Line CRM Variable (group SETTINGS_VARIABLE_GROUP) holding
+     * user ids that are listed in EVERY user's Team Member picklist regardless
+     * of their region (temporary visibility for e.g. an owner with no region).
+     * Value is free-form text containing the ids ("{}" / blank = none) - see
+     * Users._parseIds().
+     */
+    TEMPORARY_VISIBLE_VARIABLE_NAME: 'temporaryVisibleUserIds'
   };
 
   /* Purpose picklist — values must match the CRM picklist exactly. */
   var REASONS = [
-    'Meeting',
-    'Demo',
-    'Collection',
-    'Follow-up',
-    'Complaint',
-    'Training',
-    'Service',
+    'Cold Call',
+    'Relationship Meeting',
+    'Sample Book Submission',
+    'Gift Distribution',
     'Payment Collection',
-    'Other'
+    'Post-sales Service',
+    'Workshop/Webinar Invitation',
+    'Work from Home',
+    'Team Meeting'
   ];
 
   /**
@@ -113,7 +165,6 @@ console.clear();
    * its own value, and the strings must match the CRM picklist exactly.
    */
   var TRANSPORTS = [
-    'Own Vehicle',
     'Company Vehicle',
     'Two Wheeler',
     'Car',
@@ -125,11 +176,21 @@ console.clear();
     'Walk'
   ];
 
-  /* Schedule_Status picklist. Only ACTIVE days accept schools / dealers. */
+  /* Schedule_Status picklist. ACTIVE and TEAM_WORKING both accept schools / dealers. */
   var STATUS_ACTIVE = 'Active';
   var STATUS_HOLIDAY = 'Holiday';
   var STATUS_LEAVE = 'Leave';
-  var SCHEDULE_STATUSES = [STATUS_ACTIVE, STATUS_HOLIDAY, STATUS_LEAVE];
+  var STATUS_TEAM_WORKING = 'Team Working';
+  var SCHEDULE_STATUSES = [STATUS_ACTIVE, STATUS_HOLIDAY, STATUS_LEAVE, STATUS_TEAM_WORKING];
+
+  /**
+   * Active and Team Working are functionally identical — both are "working"
+   * days that accept School / Dealer visits. Holiday and Leave are not.
+   * Single source of truth so the two statuses never drift apart again.
+   */
+  function isPlannableStatus(status) {
+    return status === STATUS_ACTIVE || status === STATUS_TEAM_WORKING;
+  }
 
   /* Weekly_Planner Status picklist value that does NOT block re-creation. */
   var PLANNER_STATUS_REJECTED = 'Reject';
@@ -337,6 +398,17 @@ console.clear();
       return list;
     },
 
+    /**
+     * The Monday of the week containing `from` — "Current Monday" for the
+     * past-weeks feature. Today if today is Mon..Sat; last week's Monday if
+     * today is Sunday (weeks in this widget run Monday..Saturday only).
+     */
+    currentMonday: function (from) {
+      var base = this.startOfDay(from || new Date());
+      var back = (base.getDay() + 6) % 7;   // Mon->0, Tue->1, ... Sun->6
+      return this.addDays(base, -back);
+    },
+
     /** "2026-08-03" - stable key, timezone independent (local parts). */
     toISO: function (date) {
       var d = this.startOfDay(date);
@@ -390,23 +462,65 @@ console.clear();
   };
 
   var Store = {
+    /** Shared {id, date, label, rangeLabel} shape used by every week option. */
+    _weekDescriptor: function (monday, year) {
+      var saturday = DateUtil.addDays(monday, CONFIG.DAYS_PER_WEEK - 1);
+      return {
+        id: DateUtil.toISO(monday),
+        date: monday,
+        label: DateUtil.shortLabel(monday, year),
+        rangeLabel: DateUtil.longLabel(monday) + '  –  ' + DateUtil.longLabel(saturday)
+      };
+    },
+
     /** Build the week options from today's date. */
     buildWeeks: function () {
       var today = new Date();
       var year = today.getFullYear();
       var mondays = DateUtil.nextMondays(CONFIG.WEEKS_TO_SHOW, today);
+      var self = this;
 
       state.weeks = mondays.map(function (monday) {
-        var saturday = DateUtil.addDays(monday, CONFIG.DAYS_PER_WEEK - 1);
-        return {
-          id: DateUtil.toISO(monday),
-          date: monday,
-          label: DateUtil.shortLabel(monday, year),
-          rangeLabel: DateUtil.longLabel(monday) + '  –  ' + DateUtil.longLabel(saturday)
-        };
+        return self._weekDescriptor(monday, year);
       });
 
       return state.weeks;
+    },
+
+    /**
+     * Admin-controlled past-weeks feature: reconciles Current Monday and/or
+     * Previous Monday against `settings` ahead of the existing next-4-week
+     * options — adds either one that should be shown and isn't there yet,
+     * removes either one that shouldn't be shown but still is (e.g. the
+     * Admin just disabled it). Idempotent and safe to call on every refresh.
+     * Current/Previous Monday are never part of the plain next-4-week list
+     * (nextMondays always starts strictly after today), so there is no
+     * collision risk when stripping them out to recompute.
+     * @param {{enabled:boolean, showCurrent:boolean, showPrevious:boolean}} settings
+     * @returns {boolean} true if state.weeks actually changed
+     */
+    applyScheduleRange: function (settings) {
+      var today = new Date();
+      var year = today.getFullYear();
+      var currentMonday = DateUtil.currentMonday(today);
+      var previousMonday = DateUtil.addDays(currentMonday, -7);
+      var currentId = DateUtil.toISO(currentMonday);
+      var previousId = DateUtil.toISO(previousMonday);
+
+      var beforeIds = state.weeks.map(function (week) { return week.id; }).join(',');
+
+      state.weeks = state.weeks.filter(function (week) {
+        return week.id !== currentId && week.id !== previousId;
+      });
+
+      var enabled = !!(settings && settings.enabled);
+      var prepend = [];
+      if (enabled && settings.showPrevious) { prepend.push(this._weekDescriptor(previousMonday, year)); }
+      if (enabled && settings.showCurrent) { prepend.push(this._weekDescriptor(currentMonday, year)); }
+      if (prepend.length) { state.weeks = prepend.concat(state.weeks); }
+
+      var afterIds = state.weeks.map(function (week) { return week.id; }).join(',');
+      return beforeIds !== afterIds;
     },
 
     getWeek: function (weekId) {
@@ -436,7 +550,8 @@ console.clear();
           holidayName: holiday ? holiday.name : '',
           locked: !!holiday,
           schools: [],
-          dealers: []
+          dealers: [],
+          teamMemberId: ''
         });
       }
       return days;
@@ -469,7 +584,15 @@ console.clear();
           if (!day.locked && SCHEDULE_STATUSES.indexOf(saved.status) > -1) {
             day.status = saved.status;
           }
-          if (day.status !== STATUS_ACTIVE) { return; }
+          if (!isPlannableStatus(day.status)) { return; }
+
+          if (day.status === STATUS_TEAM_WORKING) {
+            // Restored as-is; a since-deactivated user just shows the
+            // placeholder in the select instead of a matching name.
+            day.teamMemberId = typeof saved.teamMemberId === 'string' ? saved.teamMemberId : '';
+            return;
+          }
+
           ['schools', 'dealers'].forEach(function (key) {
             if (!Array.isArray(saved[key])) { return; }
             saved[key].slice(0, CONFIG.MAX_ROWS_PER_TYPE).forEach(function (entry) {
@@ -573,19 +696,30 @@ console.clear();
       day.dealers = [];
     },
 
-    isActive: function (day) { return !!day && day.status === STATUS_ACTIVE; },
+    /** Active and Team Working both count as "on" — see isPlannableStatus. */
+    isActive: function (day) { return !!day && isPlannableStatus(day.status); },
 
     /**
      * Set a day's Schedule_Status. Holiday / Leave drop any planned visits —
-     * an off day carries no schools or dealers into the CRM payload.
+     * an off day carries no schools or dealers into the CRM payload. Team
+     * Working also drops them: School/Dealer are Active-only, replaced for
+     * that day by the single Team Member field (see setTeamMember).
      * @returns {boolean} false when the day is locked by a CRM holiday
      */
     setStatus: function (dayId, status) {
       var day = this.getDay(dayId);
       if (!day || day.locked || SCHEDULE_STATUSES.indexOf(status) < 0) { return false; }
       day.status = status;
-      if (status !== STATUS_ACTIVE) { this.clearDay(dayId); }
+      if (!isPlannableStatus(status) || status === STATUS_TEAM_WORKING) { this.clearDay(dayId); }
       return true;
+    },
+
+    /** Team Member is per-day and only meaningful while status is Team Working. */
+    setTeamMember: function (dayId, teamMemberId) {
+      var day = this.getDay(dayId);
+      if (!day) { return null; }
+      day.teamMemberId = typeof teamMemberId === 'string' ? teamMemberId : '';
+      return day;
     },
 
     /** Reset the whole active week. */
@@ -598,9 +732,16 @@ console.clear();
 
     /** Aggregate counters used by the summary bar. */
     totals: function () {
-      var out = { schools: 0, dealers: 0, days: 0, entries: 0, offDays: 0, incompleteDays: 0 };
+      var out = {
+        schools: 0, dealers: 0, days: 0, entries: 0,
+        teamAssigned: 0, offDays: 0, incompleteDays: 0
+      };
       state.days.forEach(function (day) {
-        if (day.status !== STATUS_ACTIVE) { out.offDays++; return; }
+        if (!isPlannableStatus(day.status)) { out.offDays++; return; }
+        if (day.status === STATUS_TEAM_WORKING) {
+          if (day.teamMemberId) { out.teamAssigned++; } else { out.incompleteDays++; }
+          return;
+        }
         var s = day.schools.length;
         var d = day.dealers.length;
         out.schools += s;
@@ -645,31 +786,26 @@ console.clear();
     },
 
     /** Always resolves: { status: 'ok'|'skipped'|'error', count }. */
-    load: function () {
-      var self = this;
+    load: async function () {
       if (!this._canInvoke()) {
         Log.warn('Holiday lookup skipped - no CRM connection available.');
-        return Promise.resolve({ status: 'skipped', count: 0 });
+        return { status: 'skipped', count: 0 };
       }
 
       try {
-        return window.ZOHO.CRM.CONNECTION.invoke(CONFIG.HOLIDAY_CONNECTION, {
+        var response = await window.ZOHO.CRM.CONNECTION.invoke(CONFIG.HOLIDAY_CONNECTION, {
           url: CONFIG.HOLIDAY_URL,
           method: 'GET',
           param_type: 1
-        }).then(function (response) {
-          var list = self._extract(response);
-          self._index(list);
-          self._loaded = true;
-          Log.info('Loaded ' + self.count() + ' business holiday(s).');
-          return { status: 'ok', count: self.count() };
-        }).catch(function (err) {
-          Log.warn('Holiday fetch failed:', err);
-          return { status: 'error', count: 0 };
         });
+        var list = this._extract(response);
+        this._index(list);
+        this._loaded = true;
+        Log.info('Loaded ' + this.count() + ' business holiday(s).');
+        return { status: 'ok', count: this.count() };
       } catch (err) {
-        Log.warn('Holiday fetch threw:', err);
-        return Promise.resolve({ status: 'error', count: 0 });
+        Log.warn('Holiday fetch failed:', err);
+        return { status: 'error', count: 0 };
       }
     },
 
@@ -721,12 +857,403 @@ console.clear();
   };
 
   /* ======================================================================
+     SETTINGS - Admin-controlled Current/Previous week schedule access
+
+     Stored as three Checkbox Zoho CRM Variables (isEnable / isCurrentWeek /
+     isPreviousWeek, group General), through the same CONNECTION.invoke
+     pattern Holidays uses above — see CONFIG.SETTINGS_* for the one-time CRM
+     setup this needs.
+
+     A failure here is never fatal: load() always resolves (to defaults when
+     nothing is configured yet or the call fails), same as Holidays. Only
+     save() — an explicit Admin action — rejects, so the settings panel can
+     show why.
+     ====================================================================== */
+
+  var Settings = {
+    _cache: null,               // last-loaded { enabled, showCurrent, showPrevious }
+    _enabledVariableId: '',     // internal ids, needed to PUT an update
+    _currentVariableId: '',
+    _previousVariableId: '',
+    _loaded: false,
+
+    defaults: function () {
+      return { enabled: false, showCurrent: false, showPrevious: false };
+    },
+
+    _canInvoke: function () {
+      return !!(state.sdkConnected && window.ZOHO && window.ZOHO.CRM &&
+                window.ZOHO.CRM.CONNECTION &&
+                typeof window.ZOHO.CRM.CONNECTION.invoke === 'function');
+    },
+
+    _getUrl: function (variableName) {
+      return CONFIG.SETTINGS_API_DOMAIN + '/crm/v8/settings/variables/' +
+        variableName + '?group=' + CONFIG.SETTINGS_VARIABLE_GROUP;
+    },
+
+    /**
+     * CONNECTION.invoke wraps the upstream body, and how deeply depends on
+     * the connection type — same defensive unwrap Holidays._extract uses.
+     */
+    _extractVariable: function (response) {
+      var candidates = [
+        response,
+        response && response.details,
+        response && response.details && response.details.statusMessage,
+        response && response.response,
+        response && response.data
+      ];
+      for (var i = 0; i < candidates.length; i++) {
+        var node = candidates[i];
+        if (!node) { continue; }
+        if (typeof node === 'string') {
+          try { node = JSON.parse(node); } catch (e) { continue; }
+        }
+        if (Array.isArray(node.variables) && node.variables[0]) { return node.variables[0]; }
+        if (node.value !== undefined || node.id !== undefined) { return node; }
+      }
+      return null;
+    },
+
+    /** Checkbox variables come back as the string "ON"/"OFF" (confirmed live; also accept true/"true" defensively). */
+    _toBool: function (value) {
+      if (typeof value === 'boolean') { return value; }
+      var normalized = String(value).trim().toLowerCase();
+      return normalized === 'on' || normalized === 'true';
+    },
+
+    _loadOne: async function (variableName) {
+      var response = await window.ZOHO.CRM.CONNECTION.invoke(CONFIG.HOLIDAY_CONNECTION, {
+        url: this._getUrl(variableName),
+        method: 'GET',
+        param_type: 1
+      });
+      return this._extractVariable(response);
+    },
+
+    /** Always resolves to a settings object — defaults when unset or unreachable. */
+    load: async function () {
+      if (this._loaded && this._cache) { return this._cache; }
+      if (!this._canInvoke()) { return this.defaults(); }
+
+      try {
+        var rows = await Promise.all([
+          this._loadOne(CONFIG.ENABLE_VARIABLE_NAME),
+          this._loadOne(CONFIG.CURRENT_VARIABLE_NAME),
+          this._loadOne(CONFIG.PREVIOUS_VARIABLE_NAME)
+        ]);
+        var enabledRow = rows[0];
+        var currentRow = rows[1];
+        var previousRow = rows[2];
+        if (enabledRow && enabledRow.id) { this._enabledVariableId = String(enabledRow.id); }
+        if (currentRow && currentRow.id) { this._currentVariableId = String(currentRow.id); }
+        if (previousRow && previousRow.id) { this._previousVariableId = String(previousRow.id); }
+
+        this._cache = {
+          enabled: this._toBool(enabledRow && enabledRow.value),
+          showCurrent: this._toBool(currentRow && currentRow.value),
+          showPrevious: this._toBool(previousRow && previousRow.value)
+        };
+        this._loaded = true;
+        return this._cache;
+      } catch (err) {
+        Log.warn('Schedule-access settings load failed - using defaults.', err);
+        this._cache = this.defaults();
+        this._loaded = true;
+        return this._cache;
+      }
+    },
+
+    /**
+     * Checkbox variables take literal "ON"/"OFF" strings, confirmed live —
+     * not "true"/"false" and not a JSON boolean, both of which the API
+     * rejects with an INVALID_DATA/expected_data_type "checkbox" error.
+     * A successful PUT's extracted row looks like
+     * {code:"SUCCESS", details:{id}, message, status:"success"} — the id
+     * lives under `details`, not at the top level.
+     */
+    _saveOne: async function (variableId, boolValue) {
+      var response = await window.ZOHO.CRM.CONNECTION.invoke(CONFIG.HOLIDAY_CONNECTION, {
+        url: CONFIG.SETTINGS_API_DOMAIN + '/crm/v8/settings/variables',
+        method: 'PUT',
+        param_type: 2,
+        parameters: { variables: [{ id: variableId, value: boolValue ? 'ON' : 'OFF' }] }
+      });
+      var row = this._extractVariable(response);
+      var ok = !!row && (row.code === 'SUCCESS' || row.status === 'success');
+      if (!ok) {
+        var reason = (row && (row.message || row.code)) || 'Save failed.';
+        throw new Error(String(reason));
+      }
+    },
+
+    /**
+     * Admin-only write: all three Variables must already exist (created
+     * manually in the CRM UI — this widget never creates them). Rejects
+     * with a readable Error on failure — the caller shows it.
+     */
+    save: async function (settings) {
+      if (!this._canInvoke()) { throw new Error('Not connected to CRM.'); }
+      var haveIds = this._enabledVariableId && this._currentVariableId && this._previousVariableId;
+      if (!haveIds) { await this.load(); }
+      haveIds = this._enabledVariableId && this._currentVariableId && this._previousVariableId;
+      if (!haveIds) {
+        throw new Error('Could not find the "' + CONFIG.ENABLE_VARIABLE_NAME + '" / "' +
+          CONFIG.CURRENT_VARIABLE_NAME + '" / "' + CONFIG.PREVIOUS_VARIABLE_NAME +
+          '" variables in the "' + CONFIG.SETTINGS_VARIABLE_GROUP + '" group.');
+      }
+
+      await Promise.all([
+        this._saveOne(this._enabledVariableId, !!settings.enabled),
+        this._saveOne(this._currentVariableId, !!settings.showCurrent),
+        this._saveOne(this._previousVariableId, !!settings.showPrevious)
+      ]);
+
+      this._cache = {
+        enabled: !!settings.enabled,
+        showCurrent: !!settings.showCurrent,
+        showPrevious: !!settings.showPrevious
+      };
+      this._loaded = true;
+      return this._cache;
+    }
+  };
+
+  /* ======================================================================
+     USERS - active CRM users, for the Team Member lookup
+
+     Team Member is a single-select field, so unlike Lookup (Accounts /
+     Vendors, searched per keystroke) the whole active-user list is fetched
+     once via CONNECTION.invoke (same pattern as Holidays/Settings above) and
+     cached for the session; the picklist just filters/selects locally.
+     A failure here is never fatal: the Team Member field is simply empty,
+     same fail-safe contract as Holidays/Settings.
+
+     Scoped to the signed-in user's own CONFIG.REGION_FIELD value (via
+     PlannerLock.currentUser(), which already fetches this user once for the
+     Weekly_Planner Owner check) and excludes the signed-in user themself —
+     backend-only filtering, no region control is ever shown in the UI.
+     Region "All" (CONFIG.REGION_ALL) is viewer-side only: a signed-in user
+     whose region is All sees every user. A user whose region is All is NOT
+     shown to other regions - use the global
+     CONFIG.TEMPORARY_VISIBLE_VARIABLE_NAME CRM Variable for users that must
+     be seen by everyone whatever their region. Any other user with an empty
+     region is hidden; if the current user has no region value, only
+     variable-listed users are shown.
+     ====================================================================== */
+
+  var Users = {
+    _list: [],       // [{id, name}], active users in the current user's own region, self excluded
+    _loaded: false,
+    _regionPromise: null,   // shared in-flight / settled current-user region fetch
+    _loadPromise: null,     // shared in-flight / settled user-list fetch
+    _currentUserRegion: '',
+
+    isLoaded: function () { return this._loaded; },
+    list: function () { return this._list; },
+
+    _canInvoke: function () {
+      return !!(state.sdkConnected && window.ZOHO && window.ZOHO.CRM &&
+                window.ZOHO.CRM.CONNECTION && typeof window.ZOHO.CRM.CONNECTION.invoke === 'function');
+    },
+
+    /**
+     * CONNECTION.invoke wraps the upstream body, and how deeply depends on
+     * the connection type - same defensive unwrap Holidays/Settings use.
+     */
+    _extract: function (response) {
+      var candidates = [
+        response,
+        response && response.details,
+        response && response.details && response.details.statusMessage,
+        response && response.response,
+        response && response.data
+      ];
+      for (var i = 0; i < candidates.length; i++) {
+        var node = candidates[i];
+        if (!node) { continue; }
+        if (typeof node === 'string') {
+          try { node = JSON.parse(node); } catch (e) { continue; }
+        }
+        if (Array.isArray(node.users)) { return node.users; }
+      }
+      return [];
+    },
+
+    /** Region as a trimmed string; handles plain values and {name|value} objects. '' when unset. */
+    _regionValue: function (raw) {
+      if (raw === undefined || raw === null) { return ''; }
+      if (typeof raw === 'object') { raw = raw.name || raw.value || raw.display_value || ''; }
+      return String(raw).trim();
+    },
+
+    /**
+     * Current signed-in user's CONFIG.REGION_FIELD value, fetched from the
+     * full user record (v8/users?type=CurrentUser) — NOT from
+     * ZOHO.CRM.CONFIG.getCurrentUser(), which only ever returns a fixed
+     * standard field set and never custom fields (confirmed by inspection:
+     * its response carries no Region, no custom field at all). Loads once
+     * per session (the in-flight promise is shared, so concurrent callers
+     * all get the real value); a failure resolves to '' so only variable-listed
+     * users are listed rather than blocking the picklist.
+     */
+    _loadCurrentUserRegion: function () {
+      if (!this._regionPromise) { this._regionPromise = this._fetchCurrentUserRegion(); }
+      return this._regionPromise;
+    },
+
+    _fetchCurrentUserRegion: async function () {
+      if (!this._canInvoke()) { return this._currentUserRegion; }
+
+      try {
+        var response = await window.ZOHO.CRM.CONNECTION.invoke(CONFIG.HOLIDAY_CONNECTION, {
+          url: CONFIG.CURRENT_USER_URL,
+          method: 'GET',
+          param_type: 1
+        });
+        var rows = this._extract(response);
+        var row = rows && rows[0];
+        var rawRegion = row ? row[CONFIG.REGION_FIELD] : undefined;
+        this._currentUserRegion = this._regionValue(rawRegion);
+
+        // Region debug: shows whether the field is on the record at all
+        // (under CONFIG.REGION_FIELD or any region-ish key) and its raw value.
+        var regionKeys = row ? Object.keys(row).filter(function (k) { return /region/i.test(k); }) : [];
+        Log.info('[Region] CurrentUser record fetched:', !!row,
+          '| total keys:', row ? Object.keys(row).length : 0,
+          '| keys matching /region/i:', regionKeys,
+          '| ' + CONFIG.REGION_FIELD + ' raw value:', rawRegion,
+          '| resolved region:', this._currentUserRegion || '(empty)');
+        if (!this._currentUserRegion) {
+          Log.warn('[Region] Current user has no ' + CONFIG.REGION_FIELD + ' value — only variable-listed users will be listed.' +
+            (regionKeys.length && regionKeys.indexOf(CONFIG.REGION_FIELD) === -1
+              ? ' A region-ish key exists though (' + regionKeys.join(', ') + ') — check CONFIG.REGION_FIELD.'
+              : ''));
+        }
+      } catch (err) {
+        Log.warn('[Region] Current user region fetch failed - only variable-listed users will be listed.', err);
+      }
+
+      return this._currentUserRegion;
+    },
+
+    /**
+     * User ids out of a variable value. Deliberately format-agnostic: pulls
+     * every run of 10+ digits, so "id1,id2", newline/space separated, a JSON
+     * array, and the "{}" / blank "empty" values all work (empty -> []).
+     */
+    _parseIds: function (value) {
+      if (value === undefined || value === null) { return []; }
+      return String(value).match(/\d{10,}/g) || [];
+    },
+
+    /**
+     * Ids from the temporary-visibility variable, as { userId: true }.
+     * Never throws: a missing/unreadable variable just contributes no ids.
+     */
+    _loadVisibleIds: async function () {
+      var name = CONFIG.TEMPORARY_VISIBLE_VARIABLE_NAME;
+      var all = {};
+      try {
+        var row = await Settings._loadOne(name);
+        var ids = this._parseIds(row && row.value);
+        Log.info('[Region] Variable "' + name + '":', row ? 'found' : 'NOT found',
+          '| raw value:', row ? row.value : undefined, '| parsed ids:', ids);
+        ids.forEach(function (id) { all[id] = true; });
+      } catch (err) {
+        Log.warn('[Region] Variable "' + name + '" load failed - treated as empty.', err);
+      }
+      return all;
+    },
+
+    /**
+     * Always resolves; loads once per session then serves the cached list.
+     * Overlapping calls (first boot + a Zoho PageLoad refresh) share one
+     * fetch instead of racing each other.
+     */
+    load: function () {
+      if (this._loaded) { return Promise.resolve(this._list); }
+      if (!this._canInvoke()) { return Promise.resolve(this._list); }
+      if (!this._loadPromise) { this._loadPromise = this._fetchList(); }
+      return this._loadPromise;
+    },
+
+    _fetchList: async function () {
+      try {
+        var owner = await PlannerLock.currentUser();
+        var region = await this._loadCurrentUserRegion();
+        var visibleIds = await this._loadVisibleIds();
+
+        var response = await window.ZOHO.CRM.CONNECTION.invoke(CONFIG.HOLIDAY_CONNECTION, {
+          url: CONFIG.USERS_URL,
+          method: 'GET',
+          param_type: 1
+        });
+        var extracted = this._extract(response);
+
+        var self = this;
+        var rows = extracted
+          .filter(function (u) { return u && u.id && (u.full_name || u.name) && String(u.id) !== owner.id; });
+
+        // Region debug: is the field coming back on the ActiveUsers rows, and
+        // how are the values distributed (counts per region)?
+        var regionCounts = {};
+        rows.forEach(function (u) {
+          var key = self._regionValue(u[CONFIG.REGION_FIELD]) || '(empty)';
+          regionCounts[key] = (regionCounts[key] || 0) + 1;
+        });
+        Log.info('[Region] ActiveUsers fetched:', extracted.length, '| excl. self:', rows.length,
+          '| field "' + CONFIG.REGION_FIELD + '" present on first row:',
+          rows.length ? (CONFIG.REGION_FIELD in rows[0]) : 'n/a',
+          '| region distribution:', regionCounts);
+
+        // A user is listed when (a) the signed-in user's region is "All" -
+        // every user is visible, (b) their id is in the temporary-visibility
+        // variable - region ignored - or (c) their region equals the
+        // signed-in user's. Anyone else, including users with an empty
+        // region or region "All" (when the viewer is not All), is hidden.
+        // If the signed-in user has no region of their own, only (b)
+        // applies. Region compare is case-insensitive.
+        var allRegion = CONFIG.REGION_ALL.toLowerCase();
+        var wanted = region.toLowerCase();
+        var seesAll = wanted === allRegion;
+        var viaAll = [];
+        var viaRegion = [];
+        var viaVariable = [];
+        rows = rows.filter(function (u) {
+          var name = u.full_name || u.name;
+          var userRegion = self._regionValue(u[CONFIG.REGION_FIELD]).toLowerCase();
+          if (seesAll) { viaAll.push(name); return true; }
+          if (visibleIds[String(u.id)]) { viaVariable.push(name); return true; }
+          if (wanted && userRegion === wanted) { viaRegion.push(name); return true; }
+          return false;
+        });
+        Log.info('[Region] Signed-in region "' + region + '"' + (seesAll ? ' (All -> sees every region)' : '') +
+          ' | listed via All:', viaAll.length, '| via variable:', viaVariable.length, viaVariable,
+          '| via same region:', viaRegion.length);
+
+        this._list = rows
+          .map(function (u) { return { id: String(u.id), name: String(u.full_name || u.name) }; })
+          .sort(function (a, b) { return a.name.localeCompare(b.name); });
+        Log.info('Loaded ' + this._list.length + ' active user(s) for Team Member' +
+          (region ? ' (region "' + region + '")' : ' (no region on current user - variable-listed users only)') + '.');
+      } catch (err) {
+        Log.warn('Active user list load failed - Team Member picklist will be empty.', err);
+      }
+      this._loaded = true;
+      return this._list;
+    }
+  };
+
+  /* ======================================================================
      PLANNER LOCK - detect a Weekly_Planner this user already created
 
      On open, one search per visible week checks Weekly_Planner for a record
-     whose Name is that week's range label ("10 Aug 2026 – 15 Aug 2026") AND
-     whose Owner is the signed-in user. A hit means this user already planned
-     that week, so it is disabled in the dropdown instead of re-created.
+     whose Name is that week's range label plus the owner's name
+     ("10 Aug 2026 – 15 Aug 2026 - Jane Doe") AND whose Owner is the signed-in
+     user. A hit means this user already planned that week, so it is disabled
+     in the dropdown instead of re-created.
 
      The Owner filter is the standard lookup every module already carries —
      no custom field needed — which is what keeps the match scoped to the
@@ -745,11 +1272,15 @@ console.clear();
     _byWeek: {},           // weekId -> Weekly_Planner id this user already created
     _createdThisSession: {}, // weekId -> true; a fresh search must never override these
     _loaded: false,
+    _ownerId: '',           // cached once fetched — the signed-in user never changes mid-session
+    _ownerName: '',
 
     isLoaded: function () { return this._loaded; },
     isLocked: function (weekId) { return this._byWeek.hasOwnProperty(weekId); },
     plannerIdFor: function (weekId) { return this._byWeek[weekId] || ''; },
     isCreatedThisSession: function (weekId) { return !!this._createdThisSession[weekId]; },
+    /** Signed-in user's display name, or '' before it has been fetched. */
+    ownerName: function () { return this._ownerName; },
 
     /** Lock a week immediately after this session creates its planner, so the
      *  dropdown reflects it without waiting on a fresh CRM search. This lock
@@ -766,23 +1297,29 @@ console.clear();
                 window.ZOHO.CRM.API && typeof window.ZOHO.CRM.API.searchRecord === 'function');
     },
 
-    /** Current user's CRM record id, or '' when the SDK cannot provide one. */
-    currentUserId: function () {
+    /**
+     * Current user's CRM record id + display name, or '' when the SDK cannot
+     * provide them. getCurrentUser() only ever returns a fixed ~27-field
+     * standard set (confirmed by inspection) — it never carries custom
+     * fields, so region is intentionally NOT read here; see
+     * Users._loadCurrentUserRegion() for that.
+     */
+    currentUser: async function () {
+      if (this._ownerId) { return { id: this._ownerId, name: this._ownerName }; }
       if (!(state.sdkConnected && window.ZOHO && window.ZOHO.CRM && window.ZOHO.CRM.CONFIG &&
             typeof window.ZOHO.CRM.CONFIG.getCurrentUser === 'function')) {
-        return Promise.resolve('');
+        return { id: '', name: '' };
       }
       try {
-        return window.ZOHO.CRM.CONFIG.getCurrentUser().then(function (response) {
-          var user = response && response.users && response.users[0];
-          return (user && user.id) ? String(user.id) : '';
-        }).catch(function (err) {
-          Log.warn('getCurrentUser failed:', err);
-          return '';
-        });
+        var response = await window.ZOHO.CRM.CONFIG.getCurrentUser();
+        var user = response && response.users && response.users[0];
+        var id = (user && user.id) ? String(user.id) : '';
+        var name = (user && (user.full_name || user.name)) ? String(user.full_name || user.name) : '';
+        if (id) { this._ownerId = id; this._ownerName = name; }
+        return { id: id, name: name };
       } catch (err) {
-        Log.warn('getCurrentUser threw:', err);
-        return Promise.resolve('');
+        Log.warn('getCurrentUser failed:', err);
+        return { id: '', name: '' };
       }
     },
 
@@ -790,35 +1327,34 @@ console.clear();
      * One Name+Owner search per week. Always resolves.
      * @returns {Promise<{status:string}>}
      */
-    loadForWeeks: function (weeks) {
-      var self = this;
+    loadForWeeks: async function (weeks) {
       if (!this._canSearch() || !weeks || !weeks.length) {
-        return Promise.resolve({ status: 'skipped' });
+        return { status: 'skipped' };
       }
-      return this.currentUserId().then(function (ownerId) {
-        if (!ownerId) { return { status: 'skipped' }; }
-        return Promise.all(weeks.map(function (week) {
-          return self._searchWeek(week, ownerId);
-        })).then(function () {
-          self._loaded = true;
-          return { status: 'ok' };
-        });
-      });
+      var self = this;
+      var owner = await this.currentUser();
+      if (!owner.id) { return { status: 'skipped' }; }
+
+      await Promise.all(weeks.map(function (week) {
+        return self._searchWeek(week, owner.id, owner.name);
+      }));
+      this._loaded = true;
+      return { status: 'ok' };
     },
 
-    _searchWeek: function (week, ownerId) {
-      var self = this;
-
+    _searchWeek: async function (week, ownerId, ownerName) {
       // This session's own create is authoritative — a re-search right after
       // an insert can lag CRM's search index and come back empty, which must
       // never be read as "actually not locked".
-      if (this._createdThisSession[week.id]) { return Promise.resolve(); }
+      if (this._createdThisSession[week.id]) { return; }
 
-      var name = App.rangeNameForWeek(week);
+      // Backslash, ( and ) are criteria syntax; an owner name like "Jane (North)"
+      // would otherwise break the query and silently disable the duplicate check.
+      var name = App.rangeNameForWeek(week, ownerName).replace(/([\\()])/g, '\\$1');
       var criteria = '((Name:equals:' + name + ')and(Owner:equals:' + ownerId + '))';
 
       try {
-        return window.ZOHO.CRM.API.searchRecord({
+        var response = await window.ZOHO.CRM.API.searchRecord({
           Entity: CONFIG.PLANNER_MODULE,
           Type: 'criteria',
           Query: criteria,
@@ -827,33 +1363,29 @@ console.clear();
           // the Reject check below is worthless against an undefined Status.
           Fields: ['Status'],
           delay: false
-        }).then(function (response) {
-          var rows = (response && Array.isArray(response.data)) ? response.data : [];
-          // Every matching record for this Name+Owner must be inspected, not
-          // just the first one: several Reject records plus a single
-          // Pending/Approved/Draft one still lock the week. Re-evaluated fresh
-          // on every call, so a week that was locked before now correctly
-          // reopens once every match is Reject (or the record was deleted).
-          var lockedId = '';
-          for (var i = 0; i < rows.length; i++) {
-            if (rows[i] && rows[i].id && rows[i].Status !== PLANNER_STATUS_REJECTED) {
-              lockedId = String(rows[i].id);
-              break;
-            }
-          }
-          if (lockedId) {
-            self._byWeek[week.id] = lockedId;
-          } else {
-            delete self._byWeek[week.id];
-          }
-        }).catch(function (err) {
-          // Zoho resolves "no match" without a data array; this net only
-          // catches genuine transport failures, which must not block the UI.
-          Log.warn('Planner lookup failed for ' + week.id + ':', err);
         });
+        var rows = (response && Array.isArray(response.data)) ? response.data : [];
+        // Every matching record for this Name+Owner must be inspected, not
+        // just the first one: several Reject records plus a single
+        // Pending/Approved/Draft one still lock the week. Re-evaluated fresh
+        // on every call, so a week that was locked before now correctly
+        // reopens once every match is Reject (or the record was deleted).
+        var lockedId = '';
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i] && rows[i].id && rows[i].Status !== PLANNER_STATUS_REJECTED) {
+            lockedId = String(rows[i].id);
+            break;
+          }
+        }
+        if (lockedId) {
+          this._byWeek[week.id] = lockedId;
+        } else {
+          delete this._byWeek[week.id];
+        }
       } catch (err) {
-        Log.warn('Planner lookup threw for ' + week.id + ':', err);
-        return Promise.resolve();
+        // Zoho resolves "no match" without a data array; this net only
+        // catches genuine transport failures, which must not block the UI.
+        Log.warn('Planner lookup failed for ' + week.id + ':', err);
       }
     }
   };
@@ -932,7 +1464,7 @@ console.clear();
         report.byDay[day.id] = {};
 
         // Holiday / Leave days carry no visits, so nothing to validate.
-        if (day.status !== STATUS_ACTIVE) {
+        if (!isPlannableStatus(day.status)) {
           report.byDay[day.id] = { school: {}, dealer: {} };
           return;
         }
@@ -981,40 +1513,35 @@ console.clear();
      * @returns {Promise<{status:string, rows:Array<{recordId,name}>}>}
      *   status: 'ok' | 'short' | 'unavailable' | 'error'
      */
-    search: function (type, term) {
+    search: async function (type, term) {
       var meta = ENTRY_META[type];
       var text = String(term || '').trim();
-      var self = this;
 
       if (!meta || text.length < CONFIG.SEARCH_MIN_CHARS) {
-        return Promise.resolve({ status: 'short', rows: [] });
+        return { status: 'short', rows: [] };
       }
       if (!this.isEnabled()) {
-        return Promise.resolve({ status: 'unavailable', rows: [] });
+        return { status: 'unavailable', rows: [] };
       }
 
       var key = this._key(meta.module, text);
       if (this._cache.hasOwnProperty(key)) {
-        return Promise.resolve({ status: 'ok', rows: this._cache[key] });
+        return { status: 'ok', rows: this._cache[key] };
       }
 
       try {
-        return window.ZOHO.CRM.API.searchRecord({
+        var response = await window.ZOHO.CRM.API.searchRecord({
           Entity: meta.module,
           Type: 'word',
           Query: text,
           delay: false
-        }).then(function (response) {
-          var rows = self._normalise(response, meta);
-          self._remember(key, rows);
-          return { status: 'ok', rows: rows };
-        }).catch(function (err) {
-          Log.warn('searchRecord failed for ' + meta.module + ':', err);
-          return { status: 'error', rows: [] };
         });
+        var rows = this._normalise(response, meta);
+        this._remember(key, rows);
+        return { status: 'ok', rows: rows };
       } catch (err) {
-        Log.warn('searchRecord threw for ' + meta.module + ':', err);
-        return Promise.resolve({ status: 'error', rows: [] });
+        Log.warn('searchRecord failed for ' + meta.module + ':', err);
+        return { status: 'error', rows: [] };
       }
     },
 
@@ -1166,7 +1693,7 @@ console.clear();
   };
 
   /* ======================================================================
-     CRM - record creation (Weekly_Planner + Meeting_Planned)
+     CRM - record creation (Weekly_Planner)
      ====================================================================== */
 
   var Crm = {
@@ -1207,45 +1734,13 @@ console.clear();
     },
 
     /** Insert one record. Rejects with a readable Error on any failure. */
-    insertOne: function (module, data) {
-      var self = this;
-      return window.ZOHO.CRM.API.insertRecord({ Entity: module, APIData: data })
-        .then(function (response) {
-          var result = self._summarise(response);
-          if (!result.ids.length) {
-            throw new Error(module + ': ' + (result.errors[0] || 'insert failed'));
-          }
-          return result.ids[0];
-        });
-    },
-
-    /**
-     * Insert many records, chunked to the API's per-call ceiling and run in
-     * series so a mid-way failure does not leave later batches racing.
-     * @returns {Promise<{ids: string[], errors: string[]}>} never rejects
-     */
-    insertMany: function (module, list) {
-      var self = this;
-      var batches = [];
-      for (var i = 0; i < list.length; i += CONFIG.INSERT_BATCH_MAX) {
-        batches.push(list.slice(i, i + CONFIG.INSERT_BATCH_MAX));
+    insertOne: async function (module, data) {
+      var response = await window.ZOHO.CRM.API.insertRecord({ Entity: module, APIData: data });
+      var result = this._summarise(response);
+      if (!result.ids.length) {
+        throw new Error(module + ': ' + (result.errors[0] || 'insert failed'));
       }
-
-      var totals = { ids: [], errors: [] };
-
-      return batches.reduce(function (chain, batch) {
-        return chain.then(function () {
-          return window.ZOHO.CRM.API.insertRecord({ Entity: module, APIData: batch })
-            .then(function (response) {
-              var result = self._summarise(response);
-              totals.ids = totals.ids.concat(result.ids);
-              totals.errors = totals.errors.concat(result.errors);
-            })
-            .catch(function (err) {
-              totals.errors.push(Boundary.describe(err));
-            });
-        });
-      }, Promise.resolve()).then(function () { return totals; });
+      return result.ids[0];
     }
   };
 
@@ -1329,13 +1824,16 @@ console.clear();
       if (text.length < CONFIG.SEARCH_MIN_CHARS) { this.close(); return; }
 
       var token = ++this._seq;
-      this._timer = window.setTimeout(function () {
+      this._timer = window.setTimeout(async function () {
         self._timer = null;
-        Lookup.search(ctx.type, text).then(Boundary.guard(function (result) {
+        try {
+          var result = await Lookup.search(ctx.type, text);
           // A newer keystroke already fired, or focus moved on.
           if (token !== self._seq || self._input !== input) { return; }
           self.render(result, text);
-        }, 'suggest-render'));
+        } catch (err) {
+          Boundary.report(err, 'suggest-render');
+        }
       }, CONFIG.SEARCH_DEBOUNCE_MS);
     },
 
@@ -1558,6 +2056,52 @@ console.clear();
       select.value = selectedId || weeks[0].id;
     },
 
+    /* --------------------------- team member ------------------------------ */
+
+    /**
+     * Fill a day's Team Member select from the active-user list. Called as
+     * each card is built; the field itself is only shown while that day's
+     * status is Team Working — see applyStatus.
+     */
+    populateTeamMemberSelect: function (select, selectedId) {
+      if (!select) { return; }
+      var users = Users.list();
+
+      Dom.clear(select);
+      var placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = (users && users.length) ? 'Select team member…' : 'No active users found';
+      select.appendChild(placeholder);
+
+      users.forEach(function (user) {
+        var option = document.createElement('option');
+        option.value = user.id;
+        option.textContent = user.name;
+        select.appendChild(option);
+      });
+
+      select.value = selectedId || '';
+    },
+
+    /**
+     * Re-paint every day-level Team Member select already on screen once the
+     * active-user list (re)loads — cards built before that load finished
+     * would otherwise be stuck showing "No active users found".
+     */
+    refreshAllTeamMemberOptions: function () {
+      var grid = this.els.dayGrid;
+      if (!grid) { return; }
+      var selects = grid.querySelectorAll('[data-day-team-member]');
+      Array.prototype.forEach.call(selects, function (select) {
+        // Re-select from state, not from the select itself: a card built
+        // before the list loaded has no matching <option>, so its DOM value
+        // is '' even though the day already holds a Team Member.
+        var card = select.closest('[data-day-card]');
+        var day = card ? Store.getDay(card.getAttribute('data-day-id')) : null;
+        View.populateTeamMemberSelect(select, day ? day.teamMemberId : select.value);
+      });
+    },
+
     /* ----------------------------- day grid ------------------------------ */
 
     renderWeek: function (days) {
@@ -1616,6 +2160,8 @@ console.clear();
         status: card.querySelector('[data-day-status]'),
         statusNote: card.querySelector('[data-status-note]'),
         addBtns: card.querySelectorAll('[data-action="add-entry"]'),
+        teamDay: card.querySelector('[data-team-day]'),
+        teamDaySelect: card.querySelector('[data-day-team-member]'),
         groups: {},
         rows: {},
         counts: {}
@@ -1631,6 +2177,8 @@ console.clear();
         refs.status.value = day.status;
         refs.status.setAttribute('aria-label', 'Schedule status for ' + day.dayName);
       }
+
+      this.populateTeamMemberSelect(refs.teamDaySelect, day.teamMemberId);
 
       ['school', 'dealer'].forEach(function (type) {
         var group = card.querySelector('[data-group="' + type + '"]');
@@ -1739,15 +2287,19 @@ console.clear();
       var counts = { school: day.schools.length, dealer: day.dealers.length };
       var total = counts.school + counts.dealer;
       var active = Store.isActive(day);
+      var isTeamWorking = day.status === STATUS_TEAM_WORKING;
+      // A Team Working day is "planned" once it has a Team Member, not a
+      // School/Dealer count — those fields don't exist on that day at all.
+      var planned = isTeamWorking ? !!day.teamMemberId : total > 0;
 
       ['school', 'dealer'].forEach(function (type) {
         if (refs.groups[type]) { refs.groups[type].hidden = counts[type] === 0; }
         Dom.text(refs.counts[type], counts[type]);
       });
 
-      if (refs.empty) { refs.empty.hidden = total > 0 || !active; }
+      if (refs.empty) { refs.empty.hidden = planned || !active; }
       if (refs.clearBtn) { refs.clearBtn.hidden = total === 0 || !active; }
-      refs.card.classList.toggle('is-planned', active && total > 0);
+      refs.card.classList.toggle('is-planned', active && planned);
 
       this.applyStatus(day, refs);
 
@@ -1755,7 +2307,7 @@ console.clear();
         Dom.text(refs.badge, this.badgeText(day, counts.school, counts.dealer));
         refs.badge.className = 'badge ' + (!active
           ? 'badge--off'
-          : (total > 0 ? 'badge--active' : 'badge--muted'));
+          : (planned ? 'badge--active' : 'badge--muted'));
       }
 
       this.refreshSummary();
@@ -1771,6 +2323,7 @@ console.clear();
       if (!refs) { return; }
 
       var active = Store.isActive(day);
+      var isTeamWorking = day.status === STATUS_TEAM_WORKING;
 
       refs.card.classList.toggle('is-off', !active);
       refs.card.classList.toggle('is-locked', !!day.locked);
@@ -1781,7 +2334,10 @@ console.clear();
       }
 
       if (refs.addBtns) {
-        Array.prototype.forEach.call(refs.addBtns, function (btn) { btn.disabled = !active; });
+        Array.prototype.forEach.call(refs.addBtns, function (btn) {
+          btn.disabled = !active;
+          btn.hidden = isTeamWorking;
+        });
       }
       if (refs.clearBtn) { refs.clearBtn.disabled = !active; }
 
@@ -1789,6 +2345,16 @@ console.clear();
         refs.card.querySelectorAll('[data-entry-input], [data-action="delete-entry"]'),
         function (el) { el.disabled = !active; }
       );
+
+      // Team Working replaces School/Dealer entirely with one day-level Team
+      // Member field: School/Dealer are neither shown nor mandatory here.
+      ['school', 'dealer'].forEach(function (type) {
+        if (refs.groups[type] && isTeamWorking) { refs.groups[type].hidden = true; }
+      });
+      if (refs.empty) { refs.empty.hidden = refs.empty.hidden || isTeamWorking; }
+
+      if (refs.teamDay) { refs.teamDay.hidden = !isTeamWorking; }
+      if (refs.teamDaySelect) { refs.teamDaySelect.disabled = !active || !!day.locked; }
 
       if (refs.statusNote) {
         var note = '';
@@ -1799,14 +2365,18 @@ console.clear();
         } else if (day.status === STATUS_HOLIDAY) {
           note = 'Marked as holiday. No visits will be planned for this day.';
         }
+        // Team Working just swaps in the Team Member field — no note, same as Active.
         Dom.text(refs.statusNote, note);
         refs.statusNote.hidden = !note;
       }
     },
 
-    /** "No Plans" | "Holiday" | "2 Schools | 1 Dealer" */
+    /** "No Plans" | "Holiday" | "Team Working" | "2 Schools | 1 Dealer" */
     badgeText: function (day, schools, dealers) {
-      if (day && day.status !== STATUS_ACTIVE) { return day.status; }
+      if (day && !isPlannableStatus(day.status)) { return day.status; }
+      if (day && day.status === STATUS_TEAM_WORKING) {
+        return day.teamMemberId ? 'Team Working' : 'No Plans';
+      }
       var parts = [];
       if (schools > 0) { parts.push(schools + ' ' + (schools === 1 ? 'School' : 'Schools')); }
       if (dealers > 0) { parts.push(dealers + ' ' + (dealers === 1 ? 'Dealer' : 'Dealers')); }
@@ -1826,7 +2396,7 @@ console.clear();
 
       if (this.els.footerHint && !this.els.footerHint.classList.contains('is-warning')) {
         var hint;
-        if (totals.entries === 0 && totals.offDays === 0) {
+        if (totals.entries === 0 && totals.offDays === 0 && totals.teamAssigned === 0) {
           hint = 'Add schools and dealers to each day, then save your plan.';
         } else {
           var parts = [];
@@ -1834,12 +2404,16 @@ console.clear();
             parts.push(totals.entries + ' visit' + (totals.entries === 1 ? '' : 's') +
               ' planned across ' + totals.days + ' day' + (totals.days === 1 ? '' : 's'));
           }
+          if (totals.teamAssigned) {
+            parts.push(totals.teamAssigned + ' day' + (totals.teamAssigned === 1 ? '' : 's') +
+              ' with a team member assigned');
+          }
           if (totals.offDays) {
             parts.push(totals.offDays + ' day' + (totals.offDays === 1 ? '' : 's') + ' off');
           }
           if (totals.incompleteDays) {
-            parts.push(totals.incompleteDays + ' Active day' + (totals.incompleteDays === 1 ? '' : 's') +
-              ' still need' + (totals.incompleteDays === 1 ? 's' : '') + ' a school or dealer');
+            parts.push(totals.incompleteDays + ' working day' + (totals.incompleteDays === 1 ? '' : 's') +
+              ' still need' + (totals.incompleteDays === 1 ? 's' : '') + ' a school, dealer or team member');
           }
           hint = parts.join(' · ') + '.';
         }
@@ -1849,16 +2423,19 @@ console.clear();
 
     /**
      * A week that is all holiday / leave is still worth recording. Every
-     * Active day, though, needs at least one visit. A week whose planner was
-     * already created this session stays disabled even if the user starts
-     * typing into the (now empty) form again — otherwise Save would create a
-     * second Weekly_Planner for the same week.
+     * Active day needs at least one visit; every Team Working day needs a
+     * Team Member instead. A week whose planner was already created this
+     * session stays disabled even if the user starts typing into the (now
+     * empty) form again — otherwise Save would create a second Weekly_Planner
+     * for the same week.
      */
     refreshSaveEnabled: function () {
       if (!this.els.saveBtn) { return; }
       var totals = Store.totals();
       var alreadyCreated = !!state.createdPlanners[state.selectedWeekId];
-      var saveable = !alreadyCreated && (totals.entries > 0 || totals.offDays > 0) && totals.incompleteDays === 0;
+      var saveable = !alreadyCreated &&
+        (totals.entries > 0 || totals.offDays > 0 || totals.teamAssigned > 0) &&
+        totals.incompleteDays === 0;
       this.els.saveBtn.disabled = !saveable || state.submitting;
     },
 
@@ -1945,6 +2522,102 @@ console.clear();
   };
 
   /* ======================================================================
+     ADMIN SETTINGS - "Enable Past Weeks" panel
+
+     Visible only to CONFIG.ADMIN_USER_ID (App.loadScheduleAccess calls
+     reveal() once that identity check passes). Reads/writes through the
+     Settings module; applies to every user once enabled, no per-user
+     targeting. onSave is self-contained (its own try/catch) rather than
+     relying on the outer Boundary.guard wrapper, matching the rest of this
+     file's async handlers — see onReset for the same pattern.
+     ====================================================================== */
+
+  var AdminSettings = {
+    els: {},
+    _draft: null,        // working copy of settings while the panel is open
+
+    init: function () {
+      this.els = {
+        gearBtn: Dom.byId('adminSettingsBtn'),
+        modal: Dom.byId('adminSettingsModal'),
+        enable: Dom.byId('adminEnablePastWeeks'),
+        rangeGroup: Dom.byId('adminScheduleRangeGroup'),
+        showCurrent: Dom.byId('adminShowCurrentWeek'),
+        showPrevious: Dom.byId('adminShowPreviousWeek'),
+        cancelBtn: Dom.byId('adminSettingsCancel'),
+        saveBtn: Dom.byId('adminSettingsSave')
+      };
+      if (!this.els.modal || !this.els.gearBtn) { return; }
+
+      Dom.on(this.els.gearBtn, 'click', Boundary.guard(this.open.bind(this), 'admin-settings-open'));
+      Dom.on(this.els.modal, 'click', Boundary.guard(function (event) {
+        if (event.target && event.target.hasAttribute('data-close-admin-settings')) { AdminSettings.close(); }
+      }, 'admin-settings-backdrop'));
+      Dom.on(this.els.cancelBtn, 'click', Boundary.guard(this.close.bind(this), 'admin-settings-cancel'));
+      Dom.on(this.els.enable, 'change', Boundary.guard(this.syncVisibility.bind(this), 'admin-settings-toggle'));
+      Dom.on(this.els.saveBtn, 'click', this.onSave.bind(this));
+    },
+
+    /** Unhide the gear button for the admin, once their identity is confirmed. */
+    reveal: function (settings) {
+      if (!this.els.gearBtn) { return; }
+      Dom.show(this.els.gearBtn);
+      this._lastLoaded = settings;
+    },
+
+    open: function () {
+      if (!this.els.modal) { return; }
+      this._draft = {
+        enabled: !!this._lastLoaded.enabled,
+        showCurrent: !!this._lastLoaded.showCurrent,
+        showPrevious: !!this._lastLoaded.showPrevious
+      };
+
+      this.els.enable.checked = this._draft.enabled;
+      this.els.showCurrent.checked = this._draft.showCurrent;
+      this.els.showPrevious.checked = this._draft.showPrevious;
+
+      this.syncVisibility();
+      Dom.show(this.els.modal);
+    },
+
+    close: function () {
+      Dom.hide(this.els.modal);
+      this._draft = null;
+    },
+
+    /** Show/hide the Range group based on the current form state. */
+    syncVisibility: function () {
+      var enabled = this.els.enable.checked;
+      if (this.els.rangeGroup) { this.els.rangeGroup.hidden = !enabled; }
+    },
+
+    onSave: async function () {
+      if (!this._draft) { return; }
+      var draft = {
+        enabled: this.els.enable.checked,
+        showCurrent: this.els.showCurrent.checked,
+        showPrevious: this.els.showPrevious.checked
+      };
+
+      this.els.saveBtn.disabled = true;
+      try {
+        var saved = await Settings.save(draft);
+        this._lastLoaded = saved;
+        Toast.success('Schedule access updated', 'Past-week settings saved.');
+        this.close();
+        // Re-apply immediately in case the admin themselves is a beneficiary.
+        await App.loadScheduleAccess();
+      } catch (err) {
+        Boundary.report(err, 'admin-settings-save');
+        Toast.error('Could not save settings', Boundary.describe(err));
+      } finally {
+        this.els.saveBtn.disabled = false;
+      }
+    }
+  };
+
+  /* ======================================================================
      APP - bootstrap + event wiring
      ====================================================================== */
 
@@ -1955,6 +2628,7 @@ console.clear();
       Modal.init();
       Suggest.init();
       View.init();
+      AdminSettings.init();
 
       // Render the UI first, then talk to the SDK: a slow or missing SDK must
       // never leave the user staring at skeletons.
@@ -1990,6 +2664,7 @@ console.clear();
         // never actually re-verified would render as open again.
         if (state.sdkConnected) {
           this.loadHolidays();
+          this.loadTeamMembers();
           this.loadPlannerLocks();
         }
       } catch (err) {
@@ -2018,9 +2693,7 @@ console.clear();
      * The UI is already interactive at this point; a failure here only
      * downgrades the widget to standalone mode (with a single info toast).
      */
-    connectSDK: function () {
-      var self = this;
-
+    connectSDK: async function () {
       if (window.__ZOHO_SDK_FAILED__ || typeof window.ZOHO === 'undefined' ||
           !window.ZOHO.embeddedApp || typeof window.ZOHO.embeddedApp.init !== 'function') {
         Log.warn('Zoho SDK unavailable - running in standalone mode.');
@@ -2028,6 +2701,7 @@ console.clear();
         return;
       }
 
+      var self = this;
       var settled = false;
       var timer = window.setTimeout(function () {
         if (settled) { return; }
@@ -2047,28 +2721,24 @@ console.clear();
           self.onPageLoad();
         }, 'PageLoad'));
 
-        window.ZOHO.embeddedApp.init()
-          .then(function () {
-            if (settled) { return; }
-            settled = true;
-            window.clearTimeout(timer);
-            state.sdkConnected = true;
-            Log.info('Zoho Embedded App SDK ready.');
-            self.resizeWidget();
-            self.loadHolidays();
-            self.loadPlannerLocks();
-          })
-          .catch(function (err) {
-            if (settled) { return; }
-            settled = true;
-            window.clearTimeout(timer);
-            Log.warn('SDK init rejected - standalone mode.', err);
-            self.announceStandalone();
-          });
-      } catch (err) {
+        await window.ZOHO.embeddedApp.init();
+        if (settled) { return; }
         settled = true;
         window.clearTimeout(timer);
-        Log.warn('SDK init threw - standalone mode.', err);
+        state.sdkConnected = true;
+        Log.info('Zoho Embedded App SDK ready.');
+        this.resizeWidget();
+        this.loadHolidays();
+        this.loadTeamMembers();
+        // Must resolve before the lock-check below, or a Current/Previous
+        // week just prepended by loadScheduleAccess would miss its search.
+        await this.loadScheduleAccess();
+        this.loadPlannerLocks();
+      } catch (err) {
+        if (settled) { return; }
+        settled = true;
+        window.clearTimeout(timer);
+        Log.warn('SDK init failed - standalone mode.', err);
         this.announceStandalone();
       }
     },
@@ -2091,17 +2761,35 @@ console.clear();
      * Holidays arrive after the first paint (the UI must not wait on the SDK),
      * so the visible week is re-stamped once they land.
      */
-    loadHolidays: function () {
-      return Holidays.load().then(Boundary.guard(function (result) {
+    loadHolidays: async function () {
+      var result = await Holidays.load();
+      try {
         if (result.status !== 'ok') { return result; }
 
-        var locked = App.applyHolidaysToWeek();
+        var locked = this.applyHolidaysToWeek();
         if (locked) {
           Toast.info(locked + ' holiday' + (locked === 1 ? '' : 's') + ' in this week',
             'Those days are locked and cannot be planned.');
         }
         return result;
-      }, 'load-holidays'));
+      } catch (err) {
+        Boundary.report(err, 'load-holidays');
+        return undefined;
+      }
+    },
+
+    /**
+     * Active-user list for the Team Member field. Loaded once per session
+     * (Users.load() short-circuits on repeat calls) and just re-painted onto
+     * whichever select is currently on screen.
+     */
+    loadTeamMembers: async function () {
+      await Users.load();
+      try {
+        View.refreshAllTeamMemberOptions();
+      } catch (err) {
+        Boundary.report(err, 'load-team-members');
+      }
     },
 
     /**
@@ -2134,16 +2822,63 @@ console.clear();
     },
 
     /**
+     * Admin-controlled past-weeks feature (see Settings/AdminSettings).
+     * Fetches the current user's identity + the admin's settings, reveals
+     * the "Enable Past Weeks" gear for the admin, and reconciles Current /
+     * Previous Monday in and out of state.weeks to match. Runs on every
+     * connectSDK/onPageLoad and right after the Admin saves, so turning the
+     * feature off removes the extra week(s) immediately — not just on the
+     * next full reload — and hops the selection off a week that just
+     * disappeared, same as applyPlannerLocks does for a locked week.
+     *
+     * Always resolves without throwing: any failure here just leaves the
+     * existing next-4-week behaviour in place for everyone, same contract
+     * as loadHolidays/loadPlannerLocks.
+     */
+    loadScheduleAccess: async function () {
+      try {
+        var owner = await PlannerLock.currentUser();
+        var settings = await Settings.load();
+
+        if (owner.id && owner.id === CONFIG.ADMIN_USER_ID) {
+          AdminSettings.reveal(settings);
+        }
+
+        var selectedBefore = state.selectedWeekId;
+        var changed = Store.applyScheduleRange(settings);
+        if (!changed) { return; }
+
+        View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
+
+        if (selectedBefore && !Store.getWeek(selectedBefore)) {
+          var fallback = state.weeks[0];
+          if (fallback) {
+            this.loadWeek(fallback.id);
+            if (View.els.weekSelect) { View.els.weekSelect.value = fallback.id; }
+          } else {
+            View.showFallback('No weeks available', 'Please reload the widget.');
+          }
+        }
+      } catch (err) {
+        Boundary.report(err, 'load-schedule-access');
+      }
+    },
+
+    /**
      * Checks every visible week against Weekly_Planner (Name + Owner) so a
      * week this user already saved cannot be picked and re-created. Runs
      * once after the SDK connects; a failure here just leaves every week
      * selectable, same as before the check existed.
      */
-    loadPlannerLocks: function () {
-      return PlannerLock.loadForWeeks(state.weeks).then(Boundary.guard(function (result) {
-        if (result.status === 'ok') { App.applyPlannerLocks(); }
+    loadPlannerLocks: async function () {
+      var result = await PlannerLock.loadForWeeks(state.weeks);
+      try {
+        if (result.status === 'ok') { this.applyPlannerLocks(); }
         return result;
-      }, 'load-planner-locks'));
+      } catch (err) {
+        Boundary.report(err, 'load-planner-locks');
+        return undefined;
+      }
     },
 
     /**
@@ -2205,15 +2940,19 @@ console.clear();
     /**
      * Fires on every Zoho widget refresh (not just the first load). The initial
      * PageLoad arrives before embeddedApp.init() resolves, so sdkConnected is
-     * still false then and this is a no-op — the init().then() flow already
+     * still false then and this is a no-op — the connectSDK() await flow already
      * runs the first planner-lock check. Once sdkConnected is true, any later
      * PageLoad means the user refreshed, so the same check must run again or
-     * a week already planned would silently become creatable.
+     * a week already planned would silently become creatable. Also re-runs
+     * loadScheduleAccess, in case the Admin changed schedule-access settings
+     * since this session started.
      */
-    onPageLoad: function () {
+    onPageLoad: async function () {
       if (!state.sdkConnected) { return; }
       Log.info('Widget refreshed - re-validating planner locks.');
       this.loadHolidays();
+      this.loadTeamMembers();
+      await this.loadScheduleAccess();
       this.loadPlannerLocks();
     },
 
@@ -2306,13 +3045,17 @@ console.clear();
         }, 120);
       }, 'grid-focusout'));
 
-      // Delegated purpose / transport + schedule-status changes
+      // Delegated purpose / transport + schedule-status + team-member changes
       Dom.on(grid, 'change', Boundary.guard(function (event) {
         var select = event.target;
         if (!select) { return; }
 
         if (select.hasAttribute('data-day-status')) {
           App.onStatusChange(select);
+          return;
+        }
+        if (select.hasAttribute('data-day-team-member')) {
+          App.onTeamMemberChange(select);
           return;
         }
         var field = select.getAttribute('data-entry-input');
@@ -2448,9 +3191,10 @@ console.clear();
     /**
      * Schedule status changed. Switching away from Active discards that day's
      * visits, so confirm first when there is something to lose — and put the
-     * dropdown back if the user says no.
+     * dropdown back if the user says no. Team Working discards them too: it
+     * replaces School/Dealer with the single Team Member field.
      */
-    onStatusChange: function (select) {
+    onStatusChange: async function (select) {
       var ctx = this.contextOf(select);
       var day = ctx ? Store.getDay(ctx.dayId) : null;
       if (!day) { return; }
@@ -2467,16 +3211,19 @@ console.clear();
       }
 
       var planned = day.schools.length + day.dealers.length;
+      var discardsVisits = planned > 0 && (!isPlannableStatus(next) || next === STATUS_TEAM_WORKING);
 
-      if (next !== STATUS_ACTIVE && planned > 0) {
-        Modal.confirm('Mark ' + day.dayName + ' as ' + next + '?',
-          'The ' + planned + ' visit' + (planned === 1 ? '' : 's') + ' planned for ' +
-          day.dateLabel + ' will be removed.',
-          'Yes, mark ' + next)
-          .then(Boundary.guard(function (ok) {
-            if (!ok) { select.value = previous; return; }
-            App.commitStatus(day, next);
-          }, 'status-confirm'));
+      if (discardsVisits) {
+        try {
+          var ok = await Modal.confirm('Mark ' + day.dayName + ' as ' + next + '?',
+            'The ' + planned + ' visit' + (planned === 1 ? '' : 's') + ' planned for ' +
+            day.dateLabel + ' will be removed.',
+            'Yes, mark ' + next);
+          if (!ok) { select.value = previous; return; }
+          this.commitStatus(day, next);
+        } catch (err) {
+          Boundary.report(err, 'status-confirm');
+        }
         return;
       }
 
@@ -2488,7 +3235,7 @@ console.clear();
       if (!Store.setStatus(day.id, status)) { return; }
 
       var refs = View.cards[day.id];
-      if (refs && status !== STATUS_ACTIVE) {
+      if (refs && (!isPlannableStatus(status) || status === STATUS_TEAM_WORKING)) {
         Dom.clear(refs.rows.school);
         Dom.clear(refs.rows.dealer);
       }
@@ -2499,27 +3246,42 @@ console.clear();
       Store.persist();
     },
 
-    onClearDay: function (button) {
+    /** Day-level Team Member changed (Team Working days only). */
+    onTeamMemberChange: function (select) {
+      var ctx = this.contextOf(select);
+      var day = ctx ? Store.getDay(ctx.dayId) : null;
+      if (!day) { return; }
+
+      Store.setTeamMember(day.id, select.value);
+      View.refreshDay(day);
+      this.clearWarningWhenClean();
+      Store.persist();
+    },
+
+    onClearDay: async function (button) {
       var ctx = this.contextOf(button);
       var day = ctx ? Store.getDay(ctx.dayId) : null;
       if (!day) { return; }
 
-      Modal.confirm('Clear ' + day.dayName + '?',
-        'All schools and dealers planned for ' + day.dateLabel + ' will be removed.',
-        'Yes, clear day')
-        .then(Boundary.guard(function (ok) {
-          if (!ok) { return; }
-          Suggest.close();
-          Store.clearDay(day.id);
-          var refs = View.cards[day.id];
-          if (refs) {
-            Dom.clear(refs.rows.school);
-            Dom.clear(refs.rows.dealer);
-          }
-          View.refreshDay(day);
-          Store.persist();
-          Toast.success(day.dayName + ' cleared', 'You can start planning this day again.');
-        }, 'clear-day-confirm'));
+      try {
+        var ok = await Modal.confirm('Clear ' + day.dayName + '?',
+          'All schools and dealers planned for ' + day.dateLabel + ' will be removed.',
+          'Yes, clear day');
+        if (!ok) { return; }
+
+        Suggest.close();
+        Store.clearDay(day.id);
+        var refs = View.cards[day.id];
+        if (refs) {
+          Dom.clear(refs.rows.school);
+          Dom.clear(refs.rows.dealer);
+        }
+        View.refreshDay(day);
+        Store.persist();
+        Toast.success(day.dayName + ' cleared', 'You can start planning this day again.');
+      } catch (err) {
+        Boundary.report(err, 'clear-day-confirm');
+      }
     },
 
     /** Live field edit: update state, re-run duplicate checks for that group. */
@@ -2559,7 +3321,7 @@ console.clear();
       }
     },
 
-    /** Debounced persistence so typing does not hammer localStorage. */
+    /** Debounced in-memory draft cache so typing does not re-serialise the week on every keystroke. */
     schedulePersist: (function () {
       var timer = null;
       return function () {
@@ -2596,45 +3358,53 @@ console.clear();
 
     /* --------------------------- footer actions -------------------------- */
 
-    onReset: function () {
+    onReset: async function () {
       var totals = Store.totals();
-      if (totals.entries === 0) {
+      if (totals.entries === 0 && totals.teamAssigned === 0) {
         Toast.info('Nothing to reset', 'This week has no planned visits yet.');
         return;
       }
 
       var week = Store.getWeek(state.selectedWeekId);
-      Modal.confirm('Reset this week?',
-        'All schools and dealers added for the week of ' + (week ? week.label : 'this week') +
-        ' will be removed. This cannot be undone.',
-        'Yes, reset week')
-        .then(Boundary.guard(function (ok) {
-          if (!ok) { return; }
-          var days = Store.resetWeek();
-          View.renderWeek(days);
-          View.setHint('Week cleared. Start adding visits again.', false);
-          Toast.success('Week reset', 'All entries for this week have been cleared.');
-        }, 'reset-confirm'));
+      try {
+        var ok = await Modal.confirm('Reset this week?',
+          'All schools and dealers added for the week of ' + (week ? week.label : 'this week') +
+          ' will be removed. This cannot be undone.',
+          'Yes, reset week');
+        if (!ok) { return; }
+
+        var days = Store.resetWeek();
+        View.renderWeek(days);
+        View.setHint('Week cleared. Start adding visits again.', false);
+        Toast.success('Week reset', 'All entries for this week have been cleared.');
+      } catch (err) {
+        Boundary.report(err, 'reset-confirm');
+      }
     },
 
     /* ------------------------- CRM payload builders ---------------------- */
 
     /**
-     * "03 Aug 2026 – 08 Aug 2026" — derived, never typed by the user.
-     * Built from the dates rather than reused from week.rangeLabel: that label
-     * is padded with double spaces for the summary bar, which would leak into
-     * the record name.
+     * "03 Aug 2026 – 08 Aug 2026 - Jane Doe" — derived, never typed by the
+     * user. Built from the dates rather than reused from week.rangeLabel:
+     * that label is padded with double spaces for the summary bar, which
+     * would leak into the record name. The owner name is appended so two
+     * people planning the same week don't collide on an identical Name.
      */
     plannerName: function () {
       var week = Store.getWeek(state.selectedWeekId);
-      return week ? this.rangeNameForWeek(week) : state.selectedWeekId;
+      return week ? this.rangeNameForWeek(week, PlannerLock.ownerName()) : state.selectedWeekId;
     },
 
-    /** Same "03 Aug 2026 – 08 Aug 2026" label, for any week (not just the selected one). */
-    rangeNameForWeek: function (week) {
+    /**
+     * Same "03 Aug 2026 – 08 Aug 2026" label for any week (not just the
+     * selected one), with the owner's name appended when known.
+     */
+    rangeNameForWeek: function (week, ownerName) {
       if (!week) { return ''; }
       var saturday = DateUtil.addDays(week.date, CONFIG.DAYS_PER_WEEK - 1);
-      return DateUtil.longLabel(week.date) + ' – ' + DateUtil.longLabel(saturday);
+      var base = DateUtil.longLabel(week.date) + ' – ' + DateUtil.longLabel(saturday);
+      return ownerName ? base + ' - ' + ownerName : base;
     },
 
     /**
@@ -2643,6 +3413,8 @@ console.clear();
      * and leaves Dealer_Name empty, and vice versa. Purpose and
      * Transport_Medium are per-row and shared by both sides.
      * Holiday / Leave days contribute a single row that records only the status.
+     * Team Working days contribute a single row too, carrying just the day's
+     * Team Member — School/Dealer never exist on a Team Working day.
      */
     buildPlannerRecord: function () {
       var rows = [];
@@ -2656,6 +3428,13 @@ console.clear();
           return;
         }
 
+        if (day.status === STATUS_TEAM_WORKING) {
+          var teamRow = { Date: day.dateISO, Schedule_Status: day.status };
+          if (day.teamMemberId) { teamRow[CONFIG.TEAM_MEMBER_FIELD] = { id: day.teamMemberId }; }
+          rows.push(teamRow);
+          return;
+        }
+
         ['school', 'dealer'].forEach(function (type) {
           var field = type === 'school' ? 'School_Name' : 'Dealer_Name';
           Store.listOf(day, type).forEach(function (entry) {
@@ -2663,7 +3442,7 @@ console.clear();
               Date: day.dateISO,
               Purpose: entry.reason,
               Transport_Medium: entry.transport,
-              Schedule_Status: STATUS_ACTIVE
+              Schedule_Status: day.status
             };
             row[field] = { id: entry.recordId };
             rows.push(row);
@@ -2676,80 +3455,44 @@ console.clear();
       return record;
     },
 
-    /**
-     * Meeting_Planned is one record per visit, not per week: every school and
-     * every dealer on an active day becomes its own row. Holiday / Leave days
-     * still produce one record so the day is accounted for, with Day_Status
-     * mirroring Schedule_Status and no school/dealer lookup attached.
-     *
-     * The Weekly_Planner lookup is NOT set here — the planner id only exists
-     * once that record has been written, so App.submit stamps it on.
-     */
-    buildMeetingRecords: function () {
-      var records = [];
-
-      state.days.forEach(function (day) {
-        if (!Store.isActive(day)) {
-          records.push({
-            Name: day.dateLabel + ' / ' + day.status,
-            Date: day.dateISO,
-            Day_Status: day.status
-          });
-          return;
-        }
-
-        ['school', 'dealer'].forEach(function (type) {
-          var meta = ENTRY_META[type];
-          var field = type === 'school' ? 'School_Name' : 'Dealer_Name';
-
-          Store.listOf(day, type).forEach(function (entry) {
-            var record = {
-              Name: day.dateLabel + ' / ' + entry.name,
-              Date: day.dateISO,
-              Type: meta.label,              // "School" / "Dealer"
-              Purpose: entry.reason,
-              Transport_Medium: entry.transport,
-              Day_Status: STATUS_ACTIVE
-            };
-            record[field] = { id: entry.recordId };
-            records.push(record);
-          });
-        });
-      });
-
-      return records;
-    },
-
-    /**
-     * Point every meeting record at the planner that was just created, so the
-     * week's meetings are associated with their Weekly_Planner record in CRM.
-     * Mutates in place: these objects are only ever used for this one insert.
-     */
-    linkMeetingsToPlanner: function (meetings, plannerId) {
-      if (!plannerId) { return meetings; }
-      meetings.forEach(function (record) {
-        record[CONFIG.MEETING_PLANNER_LOOKUP] = { id: plannerId };
-      });
-      return meetings;
-    },
-
-    onSave: function () {
+    onSave: async function () {
       var totals = Store.totals();
 
       if (state.submitting) { return; }
 
-      if (totals.entries === 0 && totals.offDays === 0) {
+      if (totals.entries === 0 && totals.offDays === 0 && totals.teamAssigned === 0) {
         Toast.warning('Nothing to save', 'Add at least one school or dealer before saving.');
         View.setHint('Add at least one visit before saving.', true);
         return;
       }
 
-      if (totals.incompleteDays > 0) {
+      // Active days need a School/Dealer visit; Team Working days need a
+      // Team Member instead — the two are mutually exclusive per day.
+      var missingVisits = 0;
+      var missingTeamMember = 0;
+      state.days.forEach(function (day) {
+        if (!Store.isActive(day)) { return; }
+        if (day.status === STATUS_TEAM_WORKING) {
+          if (!day.teamMemberId) { missingTeamMember++; }
+        } else if (day.schools.length + day.dealers.length === 0) {
+          missingVisits++;
+        }
+      });
+
+      if (missingTeamMember > 0) {
+        Toast.error('Team Member required',
+          missingTeamMember + ' Team Working ' + (missingTeamMember === 1 ? 'day needs' : 'days need') +
+          ' a Team Member selected before saving.');
+        View.setHint('Select a Team Member for every Team Working day before saving.', true);
+        return;
+      }
+
+      if (missingVisits > 0) {
         Toast.error('School or Dealer required',
-          totals.incompleteDays + ' Active day' + (totals.incompleteDays === 1 ? '' : 's') +
+          missingVisits + ' working day' + (missingVisits === 1 ? '' : 's') +
           ' need at least one School or Dealer, or mark ' +
-          (totals.incompleteDays === 1 ? 'it' : 'them') + ' as Holiday/Leave.');
-        View.setHint('Add at least one School or Dealer to every Active day before saving.', true);
+          (missingVisits === 1 ? 'it' : 'them') + ' as Holiday/Leave.');
+        View.setHint('Add at least one School or Dealer to every working day before saving.', true);
         return;
       }
 
@@ -2785,7 +3528,8 @@ console.clear();
       state.submitting = true;
       View.refreshSaveEnabled();
 
-      App.recheckPlannerLock(week).then(Boundary.guard(function (locked) {
+      try {
+        var locked = await App.recheckPlannerLock(week);
         state.submitting = false;
         View.refreshSaveEnabled();
 
@@ -2810,10 +3554,8 @@ console.clear();
         Store.persist();
 
         var planner = App.buildPlannerRecord();
-        var meetings = App.buildMeetingRecords();
 
         Log.info('Weekly Planner payload', planner);
-        Log.info('Meeting Planned payload (' + meetings.length + ' record(s))', meetings);
 
         if (!Crm.isReady()) {
           // Outside CRM there is nothing to write to; log so the shape is checkable.
@@ -2826,19 +3568,22 @@ console.clear();
         var summary = [
           totals.entries + ' visit' + (totals.entries === 1 ? '' : 's')
         ];
+        if (totals.teamAssigned) {
+          summary.push(totals.teamAssigned + ' team working day' + (totals.teamAssigned === 1 ? '' : 's'));
+        }
         if (totals.offDays) {
           summary.push(totals.offDays + ' holiday/leave day' + (totals.offDays === 1 ? '' : 's'));
         }
 
-        var question = 'This creates 1 ' + CONFIG.PLANNER_MODULE + ' record and ' + meetings.length + ' ' +
-          CONFIG.MEETING_MODULE + ' record' + (meetings.length === 1 ? '' : 's') + ' — ' +
-          summary.join(', ') + '.';
+        var question = 'This creates 1 ' + CONFIG.PLANNER_MODULE + ' record — ' + summary.join(', ') + '.';
 
-        Modal.confirm('Create weekly plan?', question, 'Yes, create records', 'primary')
-          .then(Boundary.guard(function (ok) {
-            if (ok) { App.submit(planner, meetings); }
-          }, 'save-confirm'));
-      }, 'save-lock-check'));
+        var ok = await Modal.confirm('Create weekly plan?', question, 'Yes, create records', 'primary');
+        if (ok) { App.submit(planner); }
+      } catch (err) {
+        state.submitting = false;
+        View.refreshSaveEnabled();
+        Boundary.report(err, 'save');
+      }
     },
 
     /**
@@ -2848,85 +3593,52 @@ console.clear();
      * Save is never gated purely by whether a refresh happened to run.
      * @returns {Promise<boolean>} true when the week is already planned
      */
-    recheckPlannerLock: function (week) {
-      if (!week) { return Promise.resolve(false); }
-      if (state.createdPlanners[week.id]) { return Promise.resolve(true); }
+    recheckPlannerLock: async function (week) {
+      if (!week) { return false; }
+      if (state.createdPlanners[week.id]) { return true; }
 
-      return PlannerLock.loadForWeeks([week]).then(function () {
-        if (!PlannerLock.isLocked(week.id)) { return false; }
-        state.createdPlanners[week.id] = PlannerLock.plannerIdFor(week.id);
-        return true;
-      });
+      await PlannerLock.loadForWeeks([week]);
+      if (!PlannerLock.isLocked(week.id)) { return false; }
+      state.createdPlanners[week.id] = PlannerLock.plannerIdFor(week.id);
+      return true;
     },
 
-    /**
-     * Create the planner, then its meetings. The two inserts are deliberately
-     * sequential: if the planner cannot be written there is no point creating
-     * orphan meeting records.
-     */
-    submit: function (planner, meetings) {
+    /** Create the planner record in CRM. */
+    submit: async function (planner) {
       state.submitting = true;
       View.setBusy(true);
       View.setHint('Creating records in CRM…', false);
 
-      var plannerId = '';
+      try {
+        var plannerId = await Crm.insertOne(CONFIG.PLANNER_MODULE, planner);
+        Log.info('Created ' + CONFIG.PLANNER_MODULE + ' ' + plannerId);
 
-      Crm.insertOne(CONFIG.PLANNER_MODULE, planner)
-        .then(function (id) {
-          plannerId = id;
-          Log.info('Created ' + CONFIG.PLANNER_MODULE + ' ' + id);
-          if (!meetings.length) { return { ids: [], errors: [] }; }
-          // Only now does the lookup have something to point at.
-          App.linkMeetingsToPlanner(meetings, plannerId);
-          Log.info('Meeting Planned payload linked to ' + CONFIG.PLANNER_MODULE + ' ' + plannerId, meetings);
-          return Crm.insertMany(CONFIG.MEETING_MODULE, meetings);
-        })
-        .then(Boundary.guard(function (result) {
-          var weekId = state.selectedWeekId;
-          state.createdPlanners[weekId] = plannerId;
-          // Lock the week immediately (refreshSaveEnabled reads this) so Save
-          // cannot fire again for it even if closeWidget() cannot actually
-          // close the popup here (e.g. standalone/dev preview).
-          PlannerLock.markCreated(weekId, plannerId);
+        var weekId = state.selectedWeekId;
+        state.createdPlanners[weekId] = plannerId;
+        // Lock the week immediately (refreshSaveEnabled reads this) so Save
+        // cannot fire again for it even if closeWidget() cannot actually
+        // close the popup here (e.g. standalone/dev preview).
+        PlannerLock.markCreated(weekId, plannerId);
 
-          if (result.errors.length) {
-            // The planner exists but some meetings did not make it — say so
-            // plainly rather than reporting a clean success. The form is left
-            // as-is so the user can see what was entered while it failed.
-            Log.error('Meeting insert errors:', result.errors);
-            Toast.error('Planner created, ' + result.errors.length + ' meeting(s) failed',
-              result.errors[0]);
-            View.setHint('Planner ' + plannerId + ' created, but ' + result.errors.length +
-              ' of ' + meetings.length + ' meeting records failed. See the console.', true);
-            return;
-          }
+        // Success: clear the entered data and re-render so the form cannot
+        // be resubmitted for this week, then restore the success hint
+        // (renderWeek's summary refresh would otherwise show the default one).
+        var days = Store.resetWeek();
+        View.renderWeek(days);
+        View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
 
-          // Success: clear the entered data and re-render so the form cannot
-          // be resubmitted for this week, then restore the success hint
-          // (renderWeek's summary refresh would otherwise show the default one).
-          var days = Store.resetWeek();
-          View.renderWeek(days);
-          View.renderWeekOptions(state.weeks, state.selectedWeekId, PlannerLock);
-
-          Toast.success('Weekly plan created',
-            CONFIG.PLANNER_MODULE + ' record + ' + result.ids.length + ' ' +
-            CONFIG.MEETING_MODULE + ' record' + (result.ids.length === 1 ? '' : 's') + ' created.');
-          View.setHint('Created planner ' + plannerId + ' with ' + result.ids.length +
-            ' meeting record' + (result.ids.length === 1 ? '' : 's') + '.', false);
-          App.closeWidget();
-        }, 'submit-done'))
-        .catch(Boundary.guard(function (err) {
-          var message = Boundary.describe(err);
-          Log.error('Save failed:', err);
-          Toast.error('Could not create the plan', message);
-          View.setHint(plannerId
-            ? 'Planner ' + plannerId + ' was created, but the meeting records failed: ' + message
-            : 'Nothing was created — ' + message, true);
-        }, 'submit-failed'))
-        .then(function () {
-          state.submitting = false;
-          View.setBusy(false);
-        });
+        Toast.success('Weekly plan created', CONFIG.PLANNER_MODULE + ' record created.');
+        View.setHint('Created planner ' + plannerId + '.', false);
+        this.closeWidget();
+      } catch (err) {
+        var message = Boundary.describe(err);
+        Log.error('Save failed:', err);
+        Toast.error('Could not create the plan', message);
+        View.setHint('Nothing was created — ' + message, true);
+      } finally {
+        state.submitting = false;
+        View.setBusy(false);
+      }
     }
   };
 
@@ -2971,9 +3683,7 @@ console.clear();
     modules: {
       school: ENTRY_META.school.module,
       dealer: ENTRY_META.dealer.module,
-      planner: CONFIG.PLANNER_MODULE,
-      meeting: CONFIG.MEETING_MODULE,
-      meetingPlannerLookup: CONFIG.MEETING_PLANNER_LOOKUP
+      planner: CONFIG.PLANNER_MODULE
     },
     version: '1.3.0'
   };
